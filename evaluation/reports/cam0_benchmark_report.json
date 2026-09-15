@@ -1,0 +1,22 @@
+{
+  "dataset": "cam0_clip150_200.avi",
+  "total_gt_frames": 34,
+  "unique_gt_persons": 1,
+  "unique_gt_employees": 0,
+  "matched_detections": 23,
+  "unmatched_gt_detections": 11,
+  "tracker_fragmentation_switches": 0,
+  "persistent_identity_switches": 0,
+  "false_merges": null,
+  "false_splits": 0,
+  "fpir": {
+    "rate": 0.0,
+    "false_promotions": 0,
+    "total_unknown_observations": 23
+  },
+  "fnir": {
+    "rate": 0.0,
+    "missed_employees": 0,
+    "total_employee_observations": 0
+  }
+}

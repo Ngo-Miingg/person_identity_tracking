@@ -88,8 +88,9 @@ def compute_quality(
 ) -> QualityInfo:
     pose = estimate_pose(kps)
 
-    # Face-pixel quality: 18 px is barely usable; 64+ px saturates.
-    size_score = _clip01((float(face_size) - 18.0) / 46.0)
+    # Small CCTV faces remain useful as multi-frame evidence, even when they
+    # are not strong enough to stand alone as an identity anchor.
+    size_score = _clip01((float(face_size) - 14.0) / 50.0)
     # Blur is computed after alignment to 112x112. Log scaling is less brittle
     # than one fixed Laplacian threshold across camera distances.
     blur_score = _clip01(math.log1p(max(float(blur), 0.0)) / math.log1p(180.0))
@@ -111,11 +112,11 @@ def compute_quality(
     )
     q = _clip01(q)
 
-    if face_size < 18 or q < 0.18:
+    if face_size < 14 or q < 0.14:
         tier = "reject"
-    elif face_size < 32 or q < 0.45:
+    elif face_size < 30 or q < 0.35:
         tier = "weak"
-    elif face_size < 48 or q < 0.68:
+    elif face_size < 46 or q < 0.58:
         tier = "support"
     else:
         tier = "strong"

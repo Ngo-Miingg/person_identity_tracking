@@ -12,7 +12,8 @@ fuse_score: True
 gmc_method: none
 proximity_thresh: 0.50
 appearance_thresh: 0.82
-with_reid: True
-# Keep native tracker ReID unchanged in this controlled phase. Project OSNet is
-# used by P-memory only for short-gap continuity and multi-view session learning.
+with_reid: False
+# Phase 1 shadow: BoT-SORT owns motion/geometry only. Project OSNet remains
+# outside the tracker so clean-feature freezing is fully observable and owned by
+# OcclusionRecoveryManager.
 model: auto

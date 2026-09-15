@@ -23,3 +23,7 @@ gallery/*
 __pycache__/
 **/__pycache__/
 *.pyc
+.appdata/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo

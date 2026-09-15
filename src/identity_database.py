@@ -52,6 +52,7 @@ class IdentityDatabase:
             self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA busy_timeout=5000")
         if not self.readonly:
             self.connection.execute("PRAGMA journal_mode=WAL")
         self.session_id = session_id or uuid.uuid4().hex
@@ -113,6 +114,8 @@ class IdentityDatabase:
                     valid_to INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE INDEX IF NOT EXISTS idx_assignment_identity ON assignments(identity_id, state);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_assignment
+                    ON assignments(tracklet_id) WHERE valid_to IS NULL;
                 CREATE TABLE IF NOT EXISTS identity_events(
                     id INTEGER PRIMARY KEY, tracklet_id INTEGER REFERENCES tracklets(id),
                     old_identity_id INTEGER, new_identity_id INTEGER, frame INTEGER NOT NULL,
@@ -184,12 +187,23 @@ class IdentityDatabase:
 
     def assign(self, tracklet_id: int, identity_id: int | None, frame: int, state: str, reason: str,
                score: float | None = None, margin: float | None = None) -> None:
-        with self.connection:
+        # Assignment intervals are a state transition. Serialize the read,
+        # close, and insert sequence so concurrent writers cannot create two
+        # open identities for one tracklet.
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
             current = self.connection.execute(
                 "SELECT id,identity_id,state,valid_from FROM assignments WHERE tracklet_id=? AND valid_to IS NULL "
                 "ORDER BY id DESC LIMIT 1", (tracklet_id,),
             ).fetchone()
             if current is not None and current["identity_id"] == identity_id and current["state"] == state:
+                self.connection.commit()
+                return
+            # A later bookkeeping pass must not downgrade a face-confirmed
+            # assignment to provisional continuity state.
+            if (current is not None and current["state"] == "CONFIRMED"
+                    and state != "CONFIRMED" and int(frame) >= int(current["valid_from"])):
+                self.connection.commit()
                 return
             if current is not None and int(current["valid_from"]) >= int(frame):
                 self.connection.execute("DELETE FROM assignments WHERE id=?", (int(current["id"]),))
@@ -201,6 +215,10 @@ class IdentityDatabase:
                 "INSERT INTO assignments(tracklet_id,identity_id,state,score,margin,reason,valid_from) VALUES(?,?,?,?,?,?,?)",
                 (tracklet_id, identity_id, state, score, margin, reason, int(frame)),
             )
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
         self._search_cache.clear()
 
     def search(self, embedding: np.ndarray, kind: str, model_name: str, model_version: str, limit: int = 10) -> list[VectorHit]:
@@ -211,7 +229,8 @@ class IdentityDatabase:
             rows = self.connection.execute(
                 "SELECT o.*,t.camera,a.identity_id FROM observations o "
                 "JOIN tracklets t ON t.id=o.tracklet_id "
-                "LEFT JOIN assignments a ON a.tracklet_id=o.tracklet_id AND a.valid_to IS NULL "
+                "LEFT JOIN assignments a ON a.tracklet_id=o.tracklet_id "
+                "AND a.valid_from <= o.frame AND (a.valid_to IS NULL OR o.frame <= a.valid_to) "
                 "WHERE o.kind=? AND o.model_name=? AND o.model_version=? AND o.dimension=? AND o.canonical=1",
                 (kind, model_name, model_version, int(query.size)),
             ).fetchall()
@@ -236,7 +255,8 @@ class IdentityDatabase:
         rows = self.connection.execute(
             "SELECT o.*,t.camera,t.local_track_id,a.identity_id FROM observations o "
             "JOIN tracklets t ON t.id=o.tracklet_id "
-            "JOIN assignments a ON a.tracklet_id=o.tracklet_id AND a.valid_to IS NULL "
+            "JOIN assignments a ON a.tracklet_id=o.tracklet_id "
+            "AND a.valid_from <= o.frame AND (a.valid_to IS NULL OR o.frame <= a.valid_to) "
             "WHERE a.identity_id IS NOT NULL AND o.canonical=1"
         ).fetchall()
         return [EmbeddingRecord(
@@ -245,13 +265,32 @@ class IdentityDatabase:
             float(row["quality"]), int(row["identity_id"]), row["pose"],
         ) for row in rows]
 
-    def promote_tracklet_references(self, tracklet_id: int, identity_id: int) -> None:
-        """Promote only observations from a face-anchored final tracklet."""
+    def promote_tracklet_references(
+        self, tracklet_id: int, identity_id: int, start_frame: int | None = None,
+        end_frame: int | None = None, *, include_body: bool = True,
+        include_face: bool = True,
+    ) -> None:
+        """Promote observations belonging to one identity segment only."""
+        clauses = ["tracklet_id=?", "frame >= ?"]
+        args: list[int] = [int(tracklet_id), int(start_frame or 0)]
+        if end_frame is not None:
+            clauses.append("frame <= ?")
+            args.append(int(end_frame))
+        kinds = []
+        if include_face:
+            kinds.append("face")
+        if include_body:
+            kinds.append("body")
+        if not kinds:
+            return
+        kind_placeholders = ",".join("?" for _ in kinds)
+        clauses.append(f"kind IN ({kind_placeholders})")
+        args.extend(kinds)
         with self.connection:
             self.connection.execute(
-                "UPDATE observations SET canonical=1 WHERE tracklet_id=? AND "
+                "UPDATE observations SET canonical=1 WHERE " + " AND ".join(clauses) + " AND "
                 "((kind='face' AND quality>=0.45) OR (kind='body' AND quality>=0.35))",
-                (int(tracklet_id),),
+                args,
             )
             self.ensure_identity(identity_id, state="VERIFIED")
 
@@ -286,38 +325,92 @@ class IdentityDatabase:
     def integrity_check(self) -> str:
         return str(self.connection.execute("PRAGMA integrity_check").fetchone()[0])
 
+    def logical_integrity_check(self) -> str:
+        """Validate identity invariants that SQLite's physical check cannot see."""
+        physical = self.integrity_check()
+        if physical != "ok":
+            return physical
+        checks = {
+            "invalid_assignment_interval": "SELECT COUNT(*) FROM assignments WHERE valid_to IS NOT NULL AND valid_to < valid_from",
+            "multiple_open_assignments": "SELECT COUNT(*) FROM (SELECT tracklet_id FROM assignments WHERE valid_to IS NULL GROUP BY tracklet_id HAVING COUNT(*) > 1)",
+            "orphan_event_identity": "SELECT COUNT(*) FROM identity_events e LEFT JOIN identities i ON i.id=COALESCE(e.new_identity_id,e.old_identity_id) WHERE COALESCE(e.new_identity_id,e.old_identity_id) IS NOT NULL AND i.id IS NULL",
+            "orphan_fusion_identity": "SELECT COUNT(*) FROM fusion_decisions f LEFT JOIN identities i ON i.id=f.identity_id WHERE f.identity_id IS NOT NULL AND i.id IS NULL",
+            "invalid_embedding_blob": "SELECT COUNT(*) FROM observations WHERE length(embedding) != dimension * 4",
+        }
+        failures = [name for name, query in checks.items() if int(self.connection.execute(query).fetchone()[0]) > 0]
+        return "ok" if not failures else "invalid: " + ", ".join(failures)
+
     def canonical_stats(self) -> dict[str, int]:
         row = self.connection.execute(
             "SELECT COUNT(*) AS observations, COUNT(DISTINCT identity_id) AS identities "
             "FROM (SELECT o.id, a.identity_id FROM observations o JOIN assignments a "
-            "ON a.tracklet_id=o.tracklet_id AND a.valid_to IS NULL WHERE o.canonical=1 AND a.identity_id IS NOT NULL)"
+            "ON a.tracklet_id=o.tracklet_id AND a.valid_from <= o.frame "
+            "AND (a.valid_to IS NULL OR o.frame <= a.valid_to) "
+            "WHERE o.canonical=1 AND a.identity_id IS NOT NULL)"
         ).fetchone()
         models = self.connection.execute(
             "SELECT COUNT(DISTINCT model_name || ':' || model_version || ':' || dimension) FROM observations WHERE canonical=1"
         ).fetchone()[0]
         return {"observations": int(row["observations"]), "identities": int(row["identities"]), "model_signatures": int(models)}
 
-    def export_canonical(self, destination: str | Path, *, max_frame: int | None = None) -> dict[str, int]:
+    def export_canonical(
+        self,
+        destination: str | Path,
+        *,
+        max_frame: int | None = None,
+        identity_ids: set[int] | None = None,
+    ) -> dict[str, int]:
         frame_clause = " AND o.frame < ?" if max_frame is not None else ""
         frame_args = (int(max_frame),) if max_frame is not None else ()
-        stats = self.canonical_stats()
+        identity_clause = " AND a.identity_id IN ({})".format(",".join("?" for _ in identity_ids)) if identity_ids else ""
+        identity_args = tuple(sorted(identity_ids)) if identity_ids else ()
+        stats_row = self.connection.execute(
+            "SELECT COUNT(*) AS observations, COUNT(DISTINCT a.identity_id) AS identities "
+            "FROM observations o JOIN assignments a ON a.tracklet_id=o.tracklet_id AND a.valid_from <= o.frame "
+            "AND (a.valid_to IS NULL OR o.frame <= a.valid_to) "
+            "WHERE o.canonical=1 AND a.identity_id IS NOT NULL" + identity_clause + frame_clause,
+            identity_args + frame_args,
+        ).fetchone()
+        stats = {
+            "observations": int(stats_row["observations"]),
+            "identities": int(stats_row["identities"]),
+            "model_signatures": 0,
+        }
         if stats["observations"] == 0 or stats["identities"] == 0:
             raise ValueError("Source DB has no canonical identity references")
-        with IdentityDatabase(destination, session_id="canonical") as target:
+        source_session = self.connection.execute("SELECT session_id FROM tracklets LIMIT 1").fetchone()
+        target_session = f"canonical:{source_session['session_id'] if source_session else uuid.uuid4().hex}"
+        with IdentityDatabase(destination, session_id=target_session) as target:
+            # Re-exporting the same source session must replace its previous
+            # snapshot, not append duplicate observations into canonical DB.
+            old_tracklets = [
+                int(row["id"]) for row in target.connection.execute(
+                    "SELECT id FROM tracklets WHERE session_id=?", (target_session,)
+                ).fetchall()
+            ]
+            if old_tracklets:
+                placeholders = ",".join("?" for _ in old_tracklets)
+                with target.connection:
+                    for table in ("assignments", "observations", "detections", "fusion_decisions", "identity_events"):
+                        target.connection.execute(f"DELETE FROM {table} WHERE tracklet_id IN ({placeholders})", old_tracklets)
+                    target.connection.execute(f"DELETE FROM tracklets WHERE id IN ({placeholders})", old_tracklets)
+            target._search_cache.clear()
             rows = self.connection.execute(
                 "SELECT DISTINCT i.id,i.employee_id,i.state FROM identities i JOIN assignments a ON a.identity_id=i.id "
                 "JOIN observations o ON o.tracklet_id=a.tracklet_id "
-                "WHERE a.valid_to IS NULL AND a.identity_id IS NOT NULL AND o.canonical=1" + frame_clause,
-                frame_args,
+                "AND a.valid_from <= o.frame AND (a.valid_to IS NULL OR o.frame <= a.valid_to) "
+                "WHERE a.identity_id IS NOT NULL AND o.canonical=1" + identity_clause + frame_clause,
+                identity_args + frame_args,
             ).fetchall()
             for row in rows:
                 target.ensure_identity(int(row["id"]), row["employee_id"], "VERIFIED")
             tracklet_map: dict[int, int] = {}
             observations = self.connection.execute(
                 "SELECT o.*,t.session_id,t.camera,t.local_track_id,a.identity_id FROM observations o "
-                "JOIN tracklets t ON t.id=o.tracklet_id JOIN assignments a ON a.tracklet_id=t.id AND a.valid_to IS NULL "
-                "WHERE o.canonical=1 AND a.identity_id IS NOT NULL" + frame_clause,
-                frame_args,
+                "JOIN tracklets t ON t.id=o.tracklet_id JOIN assignments a ON a.tracklet_id=t.id "
+                "AND a.valid_from <= o.frame AND (a.valid_to IS NULL OR o.frame <= a.valid_to) "
+                "WHERE o.canonical=1 AND a.identity_id IS NOT NULL" + identity_clause + frame_clause,
+                identity_args + frame_args,
             ).fetchall()
             for row in observations:
                 old_tid = int(row["tracklet_id"])
@@ -334,12 +427,19 @@ class IdentityDatabase:
                     "UPDATE observations SET canonical=1 WHERE id=(SELECT MAX(id) FROM observations)"
                 )
             for old_tid, new_tid in tracklet_map.items():
-                row = self.connection.execute(
-                    "SELECT identity_id,valid_from FROM assignments WHERE tracklet_id=? AND valid_to IS NULL",
+                assignments = self.connection.execute(
+                    "SELECT identity_id,valid_from,valid_to FROM assignments "
+                    "WHERE tracklet_id=? AND identity_id IS NOT NULL ORDER BY valid_from",
                     (old_tid,),
-                ).fetchone()
-                if row:
-                    target.assign(new_tid, int(row["identity_id"]), int(row["valid_from"]), "VERIFIED", "canonical_import")
+                ).fetchall()
+                for assignment in assignments:
+                    target.ensure_identity(int(assignment["identity_id"]), state="VERIFIED")
+                    target.connection.execute(
+                        "INSERT INTO assignments(tracklet_id,identity_id,state,reason,valid_from,valid_to) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (new_tid, int(assignment["identity_id"]), "VERIFIED", "canonical_import",
+                         int(assignment["valid_from"]), assignment["valid_to"]),
+                    )
             target.connection.commit()
             if target.integrity_check() != "ok":
                 raise RuntimeError("Canonical DB integrity check failed")

@@ -1,0 +1,227 @@
+.archive-container {
+  display: grid;
+  grid-template-columns: 360px 1fr;
+  height: 100%;
+  gap: 16px;
+  padding: 16px;
+  overflow: hidden;
+}
+
+/* Jobs History Sidebar */
+.archive-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.filter-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.status-tabs {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+}
+
+.status-tab {
+  padding: 3px 8px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  border-radius: var(--radius-xs);
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  background: var(--bg-surface-raised);
+}
+
+.status-tab.active {
+  background: var(--color-cyan-glow);
+  color: var(--color-cyan);
+  border-color: var(--color-cyan-border);
+  font-weight: 600;
+}
+
+.jobs-ledger {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.job-card {
+  padding: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.job-card:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-medium);
+}
+
+.job-card.active {
+  background: linear-gradient(90deg, rgba(0, 229, 255, 0.12) 0%, rgba(0, 229, 255, 0.02) 100%);
+  border-color: var(--color-cyan-border);
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.15);
+}
+
+.job-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.job-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+
+.job-meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* Detail Workspace */
+.archive-detail-pane {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+  gap: 16px;
+  padding: 16px;
+}
+
+.detail-banner {
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.detail-banner-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.detail-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #fff;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.artifacts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.artifact-card {
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: all 0.15s ease;
+}
+
+.artifact-card:hover {
+  border-color: var(--color-cyan-border);
+  background: var(--bg-surface-hover);
+}
+
+.artifact-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.artifact-file-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.artifact-filename {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.artifact-filesize {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+
+/* Console Log Terminal */
+.log-terminal {
+  background: #02050c;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  height: 360px;
+  overflow: hidden;
+}
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: #070d18;
+  border-bottom: 1px solid var(--border-subtle);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.terminal-body {
+  flex: 1;
+  padding: 12px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: #a5b4fc;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

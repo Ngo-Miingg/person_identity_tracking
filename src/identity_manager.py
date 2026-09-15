@@ -17,6 +17,8 @@ class TrackIdentityState:
     conflict_candidate_id: str | None = None
     conflict_candidate_votes: int = 0
     conflict_candidate_weight: float = 0.0
+    candidate_last_frame: int = -1
+    conflict_last_frame: int = -1
     events: list[IdentityEvent] = field(default_factory=list)
 
 
@@ -31,13 +33,15 @@ class IdentityManager:
         self,
         min_confirmations: int = 3,
         min_confirmation_weight: float = 1.45,
-        min_support_quality: float = 0.32,
+        min_support_quality: float = 0.45,
         strong_quality: float = 0.68,
+        max_vote_gap: int = 16,
     ) -> None:
         self.min_confirmations = int(min_confirmations)
         self.min_confirmation_weight = float(min_confirmation_weight)
         self.min_support_quality = float(min_support_quality)
         self.strong_quality = float(strong_quality)
+        self.max_vote_gap = max(int(max_vote_gap), 1)
         self.states: dict[int, TrackIdentityState] = {}
 
     def ensure(self, track_id: int, frame: int) -> TrackIdentityState:
@@ -49,12 +53,27 @@ class IdentityManager:
 
     def update(self, track_id: int, frame: int, hit: GalleryHit | None, quality: float, tier: str) -> TrackIdentityState:
         st = self.ensure(track_id, frame)
-        if hit is None or tier == "reject" or quality < self.min_support_quality:
+        # Weak faces are useful diagnostics, but are not reliable enough to
+        # confirm or reassign an employee identity.
+        if hit is None or tier not in {"support", "strong"} or quality < self.min_support_quality:
             return st
+
+        if st.candidate_last_frame >= 0 and int(frame) - st.candidate_last_frame > self.max_vote_gap:
+            st.candidate_id = None
+            st.candidate_votes = 0
+            st.candidate_weight = 0.0
+        if st.conflict_last_frame >= 0 and int(frame) - st.conflict_last_frame > self.max_vote_gap:
+            st.conflict_candidate_id = None
+            st.conflict_candidate_votes = 0
+            st.conflict_candidate_weight = 0.0
 
         if st.state == "CONFIRMED":
             if hit.accepted and hit.name == st.employee_id:
                 st.conflict_streak = 0
+                st.conflict_candidate_id = None
+                st.conflict_candidate_votes = 0
+                st.conflict_candidate_weight = 0.0
+                st.conflict_last_frame = -1
                 # Do not spam an event every frame; confirmation is sticky.
                 return st
             if hit.accepted and hit.name != st.employee_id:
@@ -66,6 +85,7 @@ class IdentityManager:
                     st.conflict_candidate_id = hit.name
                     st.conflict_candidate_votes = 1
                     st.conflict_candidate_weight = max(float(quality), 0.05)
+                st.conflict_last_frame = int(frame)
                 enough_switch = (
                     st.conflict_candidate_votes >= self.min_confirmations
                     and st.conflict_candidate_weight >= self.min_confirmation_weight
@@ -82,6 +102,7 @@ class IdentityManager:
                     st.conflict_candidate_id = None
                     st.conflict_candidate_votes = 0
                     st.conflict_candidate_weight = 0.0
+                    st.conflict_last_frame = -1
                 else:
                     st.events.append(IdentityEvent(frame, "CONFLICT", st.employee_id, hit.score, hit.margin, quality,
                                                    f"candidate:{hit.name}"))
@@ -100,6 +121,7 @@ class IdentityManager:
         else:
             st.candidate_votes += 1
             st.candidate_weight += weight
+        st.candidate_last_frame = int(frame)
 
         enough = st.candidate_votes >= self.min_confirmations and st.candidate_weight >= self.min_confirmation_weight
         strong_fast_path = (

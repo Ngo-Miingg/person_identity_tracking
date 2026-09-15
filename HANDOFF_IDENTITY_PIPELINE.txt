@@ -1,0 +1,749 @@
+IDENTITY PIPELINE TECHNICAL HANDOFF
+===================================
+Repository: D:\Work\Tinasoft\DetectPerson\person_identity_tracking
+Date: 2026-09-14
+Mode: implementation handoff
+
+1. EXECUTIVE SUMMARY
+--------------------
+The current runnable path is infer.py -> src.infer_engine.main(). tools/run.py
+is a wrapper around that entrypoint. The intended labels are L (raw tracker), O
+(immutable observed instance), G (persistent anonymous profile), and EMP (gallery
+employee). Internally, the current PersonMemory profile ID is Pxxx and the UI
+maps it to Gxxx; P and G are therefore not separate runtime objects.
+
+Confirmed from source:
+- PersonMemory.tracks uses (camera, O instance_id), not raw L.
+- TrackInstanceManager creates a new O when the same camera/raw ID has a gap > 60.
+- O lifecycle does not delete persistent profiles.
+- Body extraction is whole person bbox, BGR->RGB, OSNet x1_0, 512-D, L2-normalized.
+- observe_body() stores pending evidence; explicit promotion requires face authority.
+- Current production SCRFD call is full-frame once per face detection frame.
+- Current face assignment is one-to-one with geometry gates and AMBIGUOUS rejection.
+- Body can support conservative O->G/P reacquisition; body cannot confirm EMP.
+- Current runtime logs per O->G body decision attribution, including body, motion,
+  combined score, runner-up, margin, sample count, consistency, and reason.
+- Ver1 source is absent. Only a cam0 output ZIP with local->global mappings exists.
+
+Important current evidence:
+- cam2 current run before the latest promotion fix: 3915 frames, 132 L, 132 O, 73 P/G profiles.
+- Two P/G profiles contain multiple O: P019 (O034,O042), P054 (O095,O106).
+- CHIRLA cam3 audit: clean descriptors 14, SAME pairs 26, DIFFERENT pairs 65.
+- On that clean pair set, top5_mean zero-wrong first occurs at .78 with SAME
+  recall 65.38%; max zero-wrong first occurs at .82 with SAME recall 61.54%.
+- cam2 simultaneous different tracks include max body cosine .9836 and centroid .9537.
+  This prevents treating body similarity as identity authority.
+
+2. CURRENT PIPELINE
+-------------------
+Video -> YOLO11s -> BoT-SORT -> raw L -> TrackInstanceManager -> O ->
+safe_crop(full person bbox) -> TorchReID/OSNet -> body evidence ->
+PersonMemory pending body / body-motion candidate -> P/G continuity.
+
+Face path:
+Video frame -> full-frame SCRFD once -> geometry-gated one-to-one assignment ->
+alignment -> AdaFace -> quality/tier -> gallery and PersonMemory face authority ->
+P/G face anchor and, only with gallery authority, EMP.
+
+Relevant current production files:
+src/infer_engine.py              CURRENT PRODUCTION: orchestration, inference, output
+src/person_memory.py             CURRENT PRODUCTION: O lifecycle state, P/G memory
+src/models.py                    CURRENT PRODUCTION: TrackKey and data models
+src/reid_embedder.py             CURRENT PRODUCTION: OSNet wrapper
+src/prototypes.py                CURRENT PRODUCTION: body/face prototype aggregation
+src/face_detector.py             CURRENT PRODUCTION: SCRFD wrapper
+src/scrfd_runtime.py             CURRENT PRODUCTION: ONNX SCRFD runtime
+src/face_quality.py              CURRENT PRODUCTION: face quality/tier
+src/face_utils.py                CURRENT PRODUCTION: face alignment helper
+src/face_temporal_tracker.py     CURRENT PRODUCTION: face temporal state
+src/anonymous_face_recognizer.py CURRENT PRODUCTION: anonymous face ranking
+src/gallery.py                   CURRENT PRODUCTION: gallery construction/matching
+src/identity_manager.py          CURRENT PRODUCTION: gallery vote state
+src/evidence_fusion.py           CURRENT PRODUCTION: DB face/body fusion
+src/identity_database.py         CURRENT PRODUCTION: SQLite observations/assignments
+src/embedding_store.py           CURRENT PRODUCTION: embedding persistence
+src/rtsp_capture.py              CURRENT PRODUCTION: RTSP reader
+src/occlusion_recovery.py        SHADOW/FORENSIC: proposal-only occlusion events
+src/head_roi.py                  LEGACY/UNUSED by current full-frame SCRFD path
+infer.py                         CURRENT ENTRYPOINT: delegates to infer_engine.main
+tools/run.py                     CURRENT WRAPPER: runs infer.py and standardizes artifacts
+tracker_botsort_reid.yaml        CURRENT TRACKER CONFIG
+
+Forensic-only files (not inference authority):
+tools/body_root_cause_audit.py   FORENSIC ONLY, created for the body audit
+evaluation/evaluate_identity.py  EVALUATION ONLY
+evaluation/tools/*               EVALUATION ONLY
+analyze_run.py                   ANALYSIS/UTILITY
+check.py                         ENVIRONMENT CHECK
+
+3. TRACK INSTANCE CODE
+----------------------
+File: src/models.py:8
+
+TrackKey = tuple[str, int]
+
+Meaning: (camera name, integer instance ID). The integer is the O allocation,
+not the raw BoT-SORT ID once infer_engine has passed through the instance manager.
+
+File: src/person_memory.py:20-63 (complete class)
+
+class TrackInstanceManager:
+    """Maps raw tracker IDs to lifecycle-bound immutable instance IDs (Oxxx).
+
+    If a raw tracker ID disappears for longer than max_gap frames and returns,
+    it is assigned a brand-new instance ID and starts completely UNBOUND.
+    """
+
+    def __init__(self, max_gap: int = 60) -> None:
+        self.max_gap = int(max_gap)
+        self._next_instance: int = 1
+        self._active_instances: dict[tuple[str, int], int] = {}
+        self._last_seen: dict[tuple[str, int], int] = {}
+        self._closed_instances: set[int] = set()
+
+    def get_or_create(self, raw_tid: int, frame: int, camera: str = "default") -> tuple[int, bool]:
+        """Returns (instance_id, is_new)."""
+        raw_key = (str(camera), int(raw_tid))
+        last = self._last_seen.get(raw_key)
+        is_new = False
+        if last is None or (int(frame) - last) > self.max_gap or raw_key not in self._active_instances:
+            old_instance = self._active_instances.get(raw_key)
+            if old_instance is not None:
+                self._closed_instances.add(old_instance)
+            instance_id = self._next_instance
+            self._next_instance += 1
+            self._active_instances[raw_key] = instance_id
+            is_new = True
+        self._last_seen[raw_key] = int(frame)
+        return self._active_instances[raw_key], is_new
+
+    def get(self, raw_tid: int, camera: str = "default") -> int | None:
+        return self._active_instances.get((str(camera), int(raw_tid)))
+
+    def object_label(self, raw_tid: int, camera: str = "default") -> str:
+        inst = self.get(raw_tid, camera)
+        return f"O{inst:03d}" if inst is not None else "O:---"
+
+    def mark_ended(self, raw_tid: int, camera: str = "default") -> int | None:
+        raw_key = (str(camera), int(raw_tid))
+        self._last_seen.pop(raw_key, None)
+        instance_id = self._active_instances.pop(raw_key, None)
+        if instance_id is not None:
+            self._closed_instances.add(instance_id)
+        return instance_id
+
+    def is_closed(self, instance_id: int) -> bool:
+        return int(instance_id) in self._closed_instances
+
+File: src/person_memory.py:126-164 (TrackBinding fields)
+
+@dataclass
+class TrackBinding:
+    key: TrackKey
+    first_frame: int
+    last_frame: int
+    person_id: int | None = None
+    bind_reason: str | None = None
+    ...
+    strong_face_conflict: bool = False
+    body_quarantined: bool = False
+    current_face_confirmations: int = 0
+    pending_body_samples: list[dict] = field(default_factory=list)
+    body_promotion_state: str = "PENDING"
+    body_promoted_count: int = 0
+    body_quarantine_reason: str | None = None
+    segments: list[TrackSegment] = field(default_factory=list)
+
+File: src/person_memory.py:598-626
+
+def ensure_track(self, key: TrackKey, frame: int) -> TrackBinding:
+    st = self.tracks.get(key)
+    if st is None:
+        st = TrackBinding(key=key, first_frame=int(frame), last_frame=int(frame))
+        self.tracks[key] = st
+        self.events.append({
+            "frame": int(frame), "camera": key[0], "track_id": key[1],
+            "event": "track_created", "person_id": None,
+        })
+    return st
+
+File: src/infer_engine.py:520-547
+
+tid = int(tid_raw)
+inst_id, _ = instance_mgr.get_or_create(tid, frame_idx, camera=cam)
+inst_map[tid] = inst_id
+key = (cam, inst_id)
+...
+memory.touch_track(key, frame_idx, box, ambiguous=bool(is_ambiguous))
+identity_db.upsert_tracklet(cam, inst_id, frame_idx)
+
+Q1: PersonMemory key is (camera, O instance_id).
+Q2: yes, when same camera/raw ID gap > max_gap (60 frames), a new O is allocated.
+Q3: no explicit P/G deletion occurs when an O ends. Profiles remain in memory.
+Q4: runtime inference state uses O keys after allocation. Raw track_id remains in
+    metadata, database column names, debug events, and compatibility fields. The
+    legacy occlusion shadow manager still internally maps raw IDs to shadow O IDs.
+
+Lifecycle limitation: process_camera does not call instance_mgr.mark_ended() on
+every disappearance. A later return with a gap creates/marks lifecycle state, but
+there is no separate closed-event API in PersonMemory. `TrackBinding` objects remain
+in `PersonMemory.tracks` for the run.
+
+4. BODY CODE
+-----------
+File: src/infer_engine.py:173-180
+
+def safe_crop(frame: np.ndarray, xyxy: np.ndarray) -> np.ndarray | None:
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = [int(round(v)) for v in xyxy]
+    x1, x2 = max(0, x1), min(w, x2)
+    y1, y2 = max(0, y1), min(h, y2)
+    if x2 - x1 < 12 or y2 - y1 < 24:
+        return None
+    return frame[y1:y2, x1:x2].copy()
+
+File: src/infer_engine.py:295-301
+
+def _body_quality(box, frame_shape, det_conf):
+    h, w = frame_shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in box]
+    bw, bh = max(x2 - x1, 0.0), max(y2 - y1, 0.0)
+    size = float(np.clip(min(bh / max(h * 0.35, 1.0), bw / max(w * 0.10, 1.0)), 0.0, 1.0))
+    clipped = float(x1 <= 1 or y1 <= 1 or x2 >= w - 2 or y2 >= h - 2)
+    return float(np.clip(0.60 * float(det_conf) + 0.40 * size - 0.10 * clipped, 0.0, 1.0))
+
+File: src/reid_embedder.py (complete class)
+
+class TorchReIDEmbedder:
+    def __init__(self, device="cuda:0", model_name="osnet_x1_0", model_path=None):
+        from torchreid.utils import FeatureExtractor
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is False")
+        if not model_path:
+            raise FileNotFoundError("OSNet checkpoint path is required.")
+        model_path = Path(model_path)
+        if not model_path.is_file():
+            raise FileNotFoundError(f"OSNet checkpoint not found: {model_path}")
+        self.extractor = FeatureExtractor(
+            model_name=model_name, model_path=str(model_path),
+            device=device, verbose=False,
+        )
+
+    @torch.inference_mode()
+    def encode(self, bgr_images):
+        images = []
+        for im in bgr_images:
+            if im is None or im.size == 0:
+                continue
+            if im.ndim != 3 or im.shape[2] != 3:
+                raise ValueError(f"Expected HxWx3 BGR image, got shape={im.shape}")
+            rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+            images.append(rgb)
+        if not images:
+            return np.empty((0, 512), dtype=np.float32)
+        features = self.extractor(images)
+        arr = features if isinstance(features, np.ndarray) else features.detach().float().cpu().numpy()
+        arr = arr.astype(np.float32, copy=False)
+        arr /= np.clip(np.linalg.norm(arr, axis=1, keepdims=True), 1e-12, None)
+        return arr
+
+TorchReID's FeatureExtractor default transform is `image_size=(256,128)`.
+
+File: src/prototypes.py:51-69
+
+def select_body_prototypes(features, max_prototypes=4):
+    if features.size == 0:
+        return []
+    feats = np.asarray(features, dtype=np.float32)
+    feats /= np.maximum(np.linalg.norm(feats, axis=1, keepdims=True), 1e-12)
+    selected = []
+    centroid = normalize(feats.mean(axis=0))
+    selected.append(centroid.astype(np.float32))
+    while len(selected) < max_prototypes and len(selected) < len(feats):
+        sims = np.stack([feats @ p for p in selected], axis=1)
+        distance_to_set = 1.0 - sims.max(axis=1)
+        idx = int(np.argmax(distance_to_set))
+        candidate = feats[idx]
+        if max(float(candidate @ p) for p in selected) > 0.985:
+            break
+        selected.append(candidate.astype(np.float32))
+    return selected
+
+Runtime uses `--max-reid-embeddings=128` reservoir and `--body-prototypes=16`.
+The track descriptor is centroid plus farthest/diverse observations. It is not a
+single all-frame average.
+
+File: src/person_memory.py:1300-1326
+
+observe_body() normalizes the embedding, rejects ambiguous/low-quality samples,
+updates O-local last_body, and appends a bounded sample to pending_body_samples.
+It does not call _add_body() and does not mutate P.body_bank.
+
+File: src/person_memory.py:1328-1372
+
+promote_body_if_authorized(key, frame, reason) requires:
+- an existing O binding to a profile;
+- reason in FACE_CONFIRMED, GALLERY_CONFIRMED, NEW_FACE_IDENTITY;
+- no strong_face_conflict/body_quarantine;
+- latest segment authority == face.
+
+It selects up to min(8, max_body_views) diverse pending samples and calls _add_body()
+only then. Normal promotion clears pending samples; quarantine blocks promotion.
+
+Body score and G reacquisition:
+
+_best_body_score() returns max cosine against all P.body_bank vectors.
+conservative_g_reacquisition() uses temporal gap, motion score, body score, a
+combined score of 0.35 motion + 0.65 body, candidate score gates, margin gating,
+and same-camera simultaneous exclusion. `maybe_seed_person()` calls it with
+`body_feat=st.last_body`.
+
+Q5: A new O can be connected to an existing G/P through body+motion policy.
+Q6: A new O can be connected through short motion-only lease logic.
+Q7: Face can reacquire/rebind an existing P/G through face authority paths.
+Q8: persistent body comparison uses max cosine; track export uses centroid/diverse
+    prototypes; DB fusion also reports max body evidence.
+Q9: current observe_body does not update persistent body bank before authority.
+    However body can influence provisional O->G candidate decisions.
+Q10: direct observe_body contamination is blocked. Remaining data paths include
+     importing already-assigned body records and canonical DB promotion; these are
+     separate persistence paths and require provenance review for final production.
+
+5. FACE CODE
+-----------
+File: src/face_detector.py:18-39
+
+class FaceDetector:
+    def __init__(self, model_path, device="cuda:0", input_size=640, threshold=.50):
+        ...
+        self.detector = SCRFD(path, device=device, input_size=(input_size, input_size))
+
+    def detect(self, frame_bgr):
+        det, kps = self.detector.detect(frame_bgr, threshold=self.threshold)
+        return [FaceDetection(d[:4].astype(np.float32), float(d[4]), p.astype(np.float32))
+                for d, p in zip(det, kps)]
+
+File: src/infer_engine.py:54-146
+
+assign_faces_one_to_one(person_boxes, person_keys, faces, face_priors) creates a
+cost matrix initialized to 1e9. A face/person candidate is eligible only when:
+- face center is within horizontal bbox extent plus 8%;
+- face center is between -12% and +50% of person height;
+- face width is <= 120% of person width.
+
+Eligible cost:
+
+    dx = abs(face_center_x - person_center_x) / person_width
+    dy = abs(face_center_y - (person_y1 + .16 * person_height)) / person_height
+    cost = .55 * dx + .45 * dy
+
+Temporal prior IoU > .25 subtracts .30 * IoU from cost. Hungarian is then run
+with scipy.optimize.linear_sum_assignment. Cost >= .85 is rejected. If a face is
+near-equally eligible for multiple persons (cost margin < .05), status is
+AMBIGUOUS and no face is returned.
+
+Output status values: ASSIGNED, NO_FACE, AMBIGUOUS.
+
+`src/infer_engine.py:610-614`:
+
+if detection_frame:
+    all_detected_faces = face_detector.detect(orig)
+
+This is the only SCRFD call in the current process-camera frame path, and it is
+full-frame. `src/head_roi.py` still exists but is not imported by current
+infer_engine.py.
+
+Downstream current path is at `src/infer_engine.py:670-696`:
+
+AdaFace encode -> compute_quality -> gallery match/update -> memory.observe_face()
+using `(cam, inst_id)` as the key. Ambiguous/unassigned faces never enter this
+path. No face means FaceTemporalTracker.miss().
+
+File: src/adaface_quality.py:12-77
+
+AdaFaceQualityEmbedder loads `ir_50` from local `third_party/AdaFace/net.py` and
+`models/adaface/adaface_ir50_webface4m.ckpt`; it normalizes `(pixels/255-.5)/.5`,
+returns a normalized 512-D feature and raw feature norm.
+
+File: src/gallery.py:96-121
+
+Gallery identity score is max cosine over pose prototypes. Gallery acceptance
+requires score >= quality-adjusted threshold and margin >= quality-adjusted margin.
+Current defaults are base threshold .55 and base margin .07.
+
+Face authority is in PersonMemory.observe_face() at src/person_memory.py:1048 and
+confirm_employee() at :1407. Gallery-confirmed IdentityManager state can call
+confirm_employee(); body-only fusion is provisional and cannot confirm EMP.
+
+Q11: production calls SCRFD once/full-frame per detection frame.
+Q12: yes, assignment is one-to-one after geometry gating.
+Q13: not through current assignment helper; one face has one assignment.
+Q14: no current path confirms EMP from body alone.
+Q15: strong face conflict sets quarantine and blocks body promotion; it also blocks
+    conservative G reacquisition.
+
+6. G ASSOCIATION CODE
+---------------------
+There is no separate `global_association.py` in the repository. Current global
+anonymous identity is implemented by PersonMemory profiles and
+conservative_g_reacquisition(). The internal profile ID Pxxx is exported/displayed
+as Gxxx by wrappers/rendering.
+
+Relevant source excerpts:
+
+    decision, target = self.conservative_g_reacquisition(
+        st, frame, body_feat=st.last_body
+    )
+
+    if decision == "REACQUIRE_G_BODY_MOTION" and target is not None:
+        self._bind(st, target, frame, "conservative_g_reacquire", reacquire=True)
+
+Current G/P merge event evidence on cam2:
+
+P019/G019:
+  O034/L034, bind frame 1510, NEW_G_STABLE_TRACK, continuity
+  O042/L042, bind frame 1697, conservative_g_reacquire, continuity, reacquire=true
+
+P054/G054:
+  O095/L095, bind frame 2959, NEW_G_STABLE_TRACK, continuity
+  O106/L106, bind frame 3387, conservative_g_reacquire, continuity, reacquire=true
+
+Current events do not contain body_score, motion_score, combined score, runner-up,
+margin, or face attribution at those merge points. Exact attribution is therefore
+NOT AVAILABLE FROM CURRENT LOGGING.
+
+Ver1 source is not present. No baseline_reid, face_reid_fusion, global matching
+source, union/find source, or old infer implementation exists in this repo/parent.
+The only old artifact is:
+D:\Work\Tinasoft\DetectPerson\person_tracking_infer_pack\person_tracking_face_infer_pack\runs\face_test_cam0.zip
+
+That ZIP contains cam0_global.mp4, cam0_local_face.mp4, global_ids.json,
+tracks.csv, reid_embeddings.npz, and face_embeddings.npz. Its global_ids.json
+has 86 local tracks mapped to 48 global IDs, with 9 multi-track global IDs and a
+maximum of 10 local tracks/G. It contains no decision source code.
+
+7. PARAMETERS
+-------------
+YOLO:
+model: models/yolo/yolo11s.pt
+imgsz: 640
+conf: .10
+classes: [0]
+
+BoT-SORT: tracker_botsort_reid.yaml
+tracker_type: botsort
+track_high_thresh: .25
+track_low_thresh: .10
+new_track_thresh: .30
+track_buffer: 60
+match_thresh: .80
+fuse_score: true
+gmc_method: none
+proximity_thresh: .50
+appearance_thresh: .82
+with_reid: false
+
+OSNet:
+model: osnet_x1_0
+checkpoint: models/osnet/osnet_x1_0_msmt17.pth
+input: 256x128
+output: 512
+reid_sample_every: 4
+max_reid_embeddings: 128
+body_prototypes: 16
+memory_min_body_quality: .35
+person_body_near: .76
+person_body_far: .84
+person_body_margin: .05
+person_max_body_views: 8
+
+O lifecycle:
+TrackInstanceManager max_gap: 60
+explicit mark_ended calls from process_camera: NOT FOUND
+
+G/P association:
+person_short_gap: 45
+person_motion_only_gap: 6
+conservative candidate score: .68
+conservative reacquire score: .74
+combined score: .35 motion + .65 body
+multi-candidate margin: .10
+same-camera simultaneous profiles: rejected
+
+Face:
+SCRFD: models/scrfd/det_10g.onnx
+SCRFD input: 640
+detector threshold: .20
+face interval: 2 frames
+minimum face size: 16
+face temporal min hits: 2
+face temporal max misses: 7
+AdaFace checkpoint: models/adaface/adaface_ir50_webface4m.ckpt
+anonymous face threshold: .68
+anonymous face margin: .08
+face confirmations: 3
+new face confirmations: 3
+gallery threshold: .55
+gallery margin: .07
+gallery minimum quality: .42
+
+8. LOGGING SCHEMA
+-----------------
+Current output artifacts from infer_engine:
+- tracks.csv
+- face_observations.csv
+- face_temporal.csv
+- face_identity_diagnostics.csv
+- identity_db_face_queries.csv
+- identity_events.json
+- track_summaries.json
+- person_memory.json
+- body_prototypes.npz
+- face_prototypes.npz
+- person_memory_prototypes.npz
+- live/biometric_events.jsonl
+- live/occlusion_events.jsonl
+
+tracks.csv current header begins:
+camera,frame,track_id,instance_id,object_id,x1,y1,x2,y2,conf,
+memory_ambiguous,face_state,face_score,...,person_id,...,identity,
+fusion_identity,fusion_state,fusion_reason,fusion_face_score,
+fusion_body_score,fusion_score,fusion_margin,...
+
+Example current cam2 tracks rows:
+cam2,150,1,1,O001,...,P001,...,UNKNOWN,...,NO_EVIDENCE
+cam2,151,1,1,O001,...,P001,...,UNKNOWN,...,NO_EVIDENCE
+cam2,1499,34,34,O034,...
+
+global_ids.json from current tools/run.py is generated from tracks.csv and contains
+global_id plus object list. Current wrapper source maps `global_id` from CSV
+`global_id` or `person_id`; current inference now emits global_id as Gxxx.
+
+identity_events.json example:
+{"camera":"cam2","track_id":34,"person_id":"P019","frame":1510,
+ "state":"UNIDENTIFIED","employee_id":null,"reason":"track_created"}
+
+person_memory event example:
+{"frame":1697,"camera":"cam2","track_id":42,"event":"bind",
+ "person_id":19,"reason":"conservative_g_reacquire",
+ "authority":"continuity","reacquire":true}
+
+Face diagnostics include face_id_person, face_id_decision, face_id_accepted,
+face_id_top1, face_id_top1_score, face_id_top2, face_id_top2_score,
+face_id_margin, votes, tier, quality. Ownership diagnostics include
+face_owner_status, face_index, face_assignment_score, and face_assignment_margin.
+
+Field availability:
+raw_track_id: MISSING as a dedicated canonical name; current field is track_id.
+object_id: PRESENT.
+instance_id: PRESENT.
+global_id: PRESENT in current export after latest runner path.
+person/profile id: PRESENT as person_id/Pxxx.
+employee id: PRESENT where gallery is used.
+body_score: PRESENT in fusion fields when DB fusion produces it; missing for
+             PersonMemory conservative merge events.
+motion_score: MISSING from runtime merge logging.
+combined_score: MISSING from runtime merge logging.
+best candidate: MISSING from runtime merge logging.
+runner-up: MISSING from runtime merge logging.
+margin: PRESENT in some face/fusion records, missing in conservative merge events.
+face score: PRESENT in face/fusion rows when available.
+face authority: PRESENT indirectly through face decision/reason/segment authority.
+G decision reason: PRESENT in person_memory events.
+before G: MISSING as a dedicated field.
+after G: PRESENT as person_id/global_id/object mapping.
+
+Rendered default label format:
+Lxxx | Oxxx | Gxxx | EMPxxx/UNKNOWN
+
+9. TESTS
+--------
+Identity/lifecycle tests:
+tests/test_invariants_abc.py
+  test_invariant_a_raw_track_reuse_after_gap_creates_new_unbound_instance
+  test_track_instance_continuous_takeover_keeps_same_o_and_camera_isolation
+  test_existing_person_profile_survives_closed_o_and_can_be_reacquired
+  test_invariant_c_strong_face_conflict_quarantines_body_and_prevents_profile_poisoning
+  test_invariant_e_conservative_g_reacquisition_after_short_gap
+  test_invariant_f_ambiguous_candidates_abstain_to_new_g
+  test_invariant_h_face_confirms_emp_and_preserved_across_reacquired_o
+  test_invariant_i_body_alone_cannot_confirm_emp
+
+tests/test_patch2_body_quarantine.py
+  test_case_1_unbound_body_stays_on_o
+  test_case_2_face_authority_explicitly_promotes_body_prototypes
+  test_case_3_body_only_reacquire_cannot_promote
+  test_case_4_face_conflict_locks_promotion_but_keeps_audit_samples
+  test_case_5_reused_o_has_isolated_pending_body
+
+Face ownership tests:
+tests/test_regressions.py
+  test_full_frame_face_assignment_is_one_to_one_and_reports_ambiguity
+  test_full_frame_face_assignment_rejects_invalid_geometry
+  test_full_frame_face_assignment_marks_crossing_face_ambiguous
+tests/test_invariants_abc.py
+  test_invariant_b_overlapping_boxes_scrfd_single_face_exclusive_assignment
+
+Body/face authority tests:
+tests/identity/test_face_authority.py
+  test_e1_body_only_cannot_confirm_employee
+  test_e2_face_authority_overrides_conflicting_body
+  test_e4_weak_or_rejected_face_cannot_change_identity
+  test_e5_ambiguity_flag_freezes_body_learning
+tests/identity/test_adversarial_scenarios.py
+  test_d6_similar_clothing_cannot_steal_employee_identity
+  test_d11_unknown_person_stays_unidentified_without_gallery
+  test_employee_cannot_be_confirmed_on_two_active_tracks
+  test_f1_memory_contamination_vector_freeze
+
+Occlusion tests:
+tests/test_occlusion_recovery.py
+  test_top3_median_is_not_maximum_similarity
+  test_shadow_links_only_after_two_by_two_clean_recovery
+  test_three_person_event_is_not_eligible
+
+Current available test result during handoff:
+81 tests passed using system pytest with a temporary import stub for unavailable
+ultralytics during collection. Production cam2 run itself completed successfully.
+
+Missing or incomplete test coverage:
+- no direct runtime test proving a real cam2 raw L reuse event;
+- no test asserting all runtime O->G events expose body/motion attribution;
+- no test proving final global_ids.json semantics against ver1;
+- no ground-truth cam2 continuity test;
+- no production crop-vs-torso ablation.
+
+10. VER1 FINDINGS
+-----------------
+SOURCE NOT FOUND.
+
+The parent repository contains only the current project and the old ZIP artifact
+described above. The old ZIP proves that a previous run created a local track to
+global ID mapping, including multiple local tracks per global ID. It does not prove
+the old tracker, thresholds, aggregation, temporal constraints, or face veto logic.
+No source-level comparison with ver1 is possible.
+
+11. CAM2 FINDINGS
+-----------------
+Current run: runs/baseline_cam2
+
+Totals:
+raw L: 132
+O: 132
+P/G profiles: 71
+G/P containing >1 O: 2
+
+Multi-O profiles:
+P019/G019 -> O034/L034 [1499-1681], O042/L042 [1684-2258]
+P054/G054 -> O095/L095 [2948-3372], O106/L106 [3375-3436]
+
+O034 -> O042:
+gap: 2 frames
+centroid: .9470
+median pairwise: .7990
+top5 mean: .9291
+max: .9599
+self consistency: .8905 / .7823
+manual contact-sheet observation: same man, black top/light trousers.
+association reason: conservative_g_reacquire for O042.
+body_score: NOT AVAILABLE FROM CURRENT LOGGING
+motion_score: NOT AVAILABLE FROM CURRENT LOGGING
+combined score: NOT AVAILABLE FROM CURRENT LOGGING
+runner-up/margin: NOT AVAILABLE FROM CURRENT LOGGING
+
+O095 -> O106:
+gap: 2 frames
+centroid: .9148
+median pairwise: .7299
+top5 mean: .9063
+max: .9399
+self consistency: .7766 / .8350
+manual contact-sheet observation: same man, black top/grey trousers.
+association reason: conservative_g_reacquire for O106.
+body_score: NOT AVAILABLE FROM CURRENT LOGGING
+motion_score: NOT AVAILABLE FROM CURRENT LOGGING
+combined score: NOT AVAILABLE FROM CURRENT LOGGING
+runner-up/margin: NOT AVAILABLE FROM CURRENT LOGGING
+
+No raw track_id was mapped to multiple object_id values in this cam2 output.
+Therefore raw L65 reuse is NOT OBSERVED in cam2 artifact.
+
+Cam2 simultaneous different examples:
+O001/O003 at frame 429: centroid .8929, median .6701, top5 .9206, max .9836
+O083/O086 at frame 2810: centroid .9537, median .7733, top5 .9219, max .9623
+O058/O063 at frame 2240: centroid .9329, median .7417, top5 .8937, max .9408
+O053/O058 at frame 2052: centroid .9261, median .7452, top5 .8900, max .9230
+O109/O112 at frame 3516: centroid .9205, median .7810, top5 .9086, max .9228
+O009/O017 at frame 1015: centroid .6654, median .4170, top5 .8952, max .9222
+O097/O098 at frame 3043: centroid .8826, median .6440, top5 .8798, max .9144
+O111/O113 at frame 3523: centroid .8422, median .6050, top5 .8653, max .9057
+O069/O078 at frame 2602: centroid .9106, median .7172, top5 .8686, max .8963
+O097/O102 at frame 3147: centroid .9201, median .6563, top5 .8848, max .8910
+
+12. BODY ROOT-CAUSE ANSWERS
+---------------------------
+B1. SAME after fragmentation is not reliably separable by OSNet/body alone.
+Evidence: CHIRLA SAME centroid min .4246 and median-pairwise median .6349;
+cam2 same candidates have strong scores but are not ground truth.
+
+B2. Different people are not rejected reliably by body alone.
+Evidence: cam2 simultaneous different O001/O003 max .9836 and O083/O086
+centroid .9537, comparable to or above same-person candidates.
+
+B3. No universal single body threshold is proven across all evidence.
+On clean CHIRLA pairs only, top5_mean .78 gives 0 wrong/65.38% SAME recall and
+max .82 gives 0 wrong/61.54% recall. Cam2 contains different-person max .9836,
+so those dataset-local thresholds cannot be promoted to production truth.
+
+B4. Current G continuity is mixed body+motion policy, not attributable to one cue.
+There are 2 logged conservative_g_reacquire events and runtime lacks per-cue
+scores. Face-specific reacquisition is not recorded for these two events.
+
+B5. Bottleneck is multi-factor:
+- crop: whole bbox contains head/background/partial/blurred views;
+- aggregation: max similarity can be dominated by one matching frame;
+- association: body weight is .65 in conservative score;
+- tracker: cam2 has 132 O for 132 local tracks and observed fragmentation;
+- logging: per-merge attribution is incomplete.
+The current evidence does not isolate OSNet weights from crop effects.
+
+13. OPEN RISKS
+-------------
+- The separate G object is not implemented; P profile ID is used as G label.
+- Body appearance can support O->G even though it cannot confirm EMP.
+- Full person crops are vulnerable to background/clothing/partial-body similarity.
+- Current runtime does not produce a complete O->G attribution record.
+- Ver1 source and cam2 ground truth are missing.
+- A long O can contain tracker takeover; current body model evaluation excludes
+  mixed-GT O, but production provenance still needs boundary handling.
+- `src/occlusion_recovery.py` is shadow-only and has its own raw-ID/O mapping;
+  it is not the production identity authority.
+
+14. FILES THAT MUST BE MODIFIED FOR IMPLEMENTATION
+---------------------------------------------------
+Minimal likely production surface, subject to a separate implementation spec:
+src/infer_engine.py
+src/person_memory.py
+src/models.py
+src/reid_embedder.py
+src/prototypes.py
+tools/run.py
+tests/test_regressions.py
+tests/test_occlusion_recovery.py
+tests/test_invariants_abc.py
+tests/test_patch2_body_quarantine.py
+
+Implementation completed for the current body tri-state/promotion scope. A missing
+promotion call in FACE_GLOBAL_REACQUIRE was fixed so face-authorized pending body
+evidence reaches persistent profile memory.
+
+15. HANDOFF STATUS
+------------------
+Production source modified by this task: src/person_memory.py
+Regression test modified by this task: tests/test_invariants_abc.py
+Handoff file created: HANDOFF_IDENTITY_PIPELINE.txt
+Evidence limitations: ver1 source absent; cam2 GT absent; O->G per-cue logging absent.
+
+HANDOFF COMPLETE
+production files modified: 1
+regression tests modified: 1

@@ -1,0 +1,298 @@
+.identity-container {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  height: 100%;
+  gap: 16px;
+  padding: 16px;
+  overflow: hidden;
+}
+
+/* Profiles List */
+.profiles-sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.search-box {
+  padding: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.search-input {
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.profiles-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.profile-card {
+  padding: 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.profile-card:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-medium);
+}
+
+.profile-card.active {
+  background: linear-gradient(90deg, rgba(0, 229, 255, 0.12) 0%, rgba(0, 229, 255, 0.02) 100%);
+  border-color: var(--color-cyan-border);
+  box-shadow: 0 0 10px rgba(0, 229, 255, 0.15);
+}
+
+.profile-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  background: #050811;
+  border: 1px solid var(--border-subtle);
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.profile-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.profile-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.profile-name-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.profile-id {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.profile-stats {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  display: flex;
+  gap: 8px;
+}
+
+/* Dossier Main View */
+.dossier-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+  gap: 16px;
+  padding: 16px;
+}
+
+.dossier-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+
+.dossier-hero-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.dossier-hero-avatar {
+  width: 72px;
+  height: 72px;
+  border-radius: var(--radius-md);
+  border: 2px solid var(--color-cyan);
+  box-shadow: 0 0 14px rgba(0, 229, 255, 0.25);
+  overflow: hidden;
+  background: #000;
+}
+
+.dossier-hero-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.dossier-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dossier-title-main {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  letter-spacing: 0.05em;
+  color: #fff;
+}
+
+.dossier-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+}
+
+.metric-card {
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metric-label {
+  font-size: 10px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.metric-value {
+  font-size: 18px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+}
+
+/* Pose Angles Matrix */
+.matrix-section {
+  background: var(--bg-surface-glass);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+.pose-column {
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pose-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+  padding-bottom: 6px;
+}
+
+.pose-gallery {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.crop-card {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  background: #050811;
+}
+
+.crop-card img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.crop-overlay-tag {
+  position: absolute;
+  bottom: 3px;
+  right: 3px;
+  background: rgba(0, 0, 0, 0.75);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 2px;
+  color: var(--color-cyan);
+}
+
+/* Body ReID Wardrobe */
+.wardrobe-section {
+  background: var(--bg-surface-glass);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.wardrobe-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+  gap: 10px;
+}
+
+.body-crop-card {
+  position: relative;
+  height: 130px;
+  border-radius: var(--radius-xs);
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  background: #050811;
+}
+
+.body-crop-card img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}

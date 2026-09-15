@@ -4,11 +4,18 @@ import argparse
 import bisect
 import csv
 import json
+import os
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
 
+# Keep the live decoder on TCP and fail stalled sockets instead of waiting
+# forever inside the OpenCV/FFmpeg reader.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000|rw_timeout;5000000|max_delay;500000",
+)
 import cv2
 import numpy as np
 import torch
@@ -26,13 +33,12 @@ if (_LOCAL_REID / "torchreid" / "__init__.py").is_file():
     sys.path.insert(0, _local_reid_str)
 
 from .adaface_quality import AdaFaceQualityEmbedder
-from .person_memory import PersonMemory
-from .face_detector import FaceDetector
+from .person_memory import PersonMemory, TrackInstanceManager
+from .face_detector import FaceDetector, FaceDetection
 from .face_quality import compute_quality, laplacian_blur_score
 from .face_temporal_tracker import FaceTemporalTracker
 from .face_utils import align_face_bgr
 from .gallery import GalleryHit, build_gallery, match_gallery
-from .head_roi import detect_best_face_in_person
 from .identity_manager import IdentityManager
 from .embedding_store import EmbeddingRecord, EmbeddingStore
 from .identity_database import IdentityDatabase
@@ -40,6 +46,113 @@ from .evidence_fusion import IdentityEvidence, TrackletEvidenceFusion
 from .models import FaceObservation, IdentityEvent, TrackKey, TrackSpan, TrackSummary
 from .prototypes import aggregate_face_observations, normalize, select_body_prototypes
 from .reid_embedder import TorchReIDEmbedder
+from .rtsp_capture import RtspLatestFrameReader
+from .occlusion_recovery import OcclusionRecoveryManager, TrackObservation
+from scipy.optimize import linear_sum_assignment
+
+
+def assign_faces_one_to_one(
+    person_boxes: list[np.ndarray],
+    person_keys: list[TrackKey],
+    faces: list[FaceDetection],
+    face_priors: dict[TrackKey, np.ndarray | None] | list[np.ndarray | None] | None = None,
+) -> dict[TrackKey, dict]:
+    """Assign full-frame faces to O keys using the existing geometry gates."""
+    result = {
+        key: {"face": None, "face_index": None, "score": None, "margin": None, "status": "NO_FACE"}
+        for key in person_keys
+    }
+    if not faces or not person_boxes:
+        return result
+
+    def prior_for(index: int, key: TrackKey) -> np.ndarray | None:
+        if isinstance(face_priors, dict):
+            return face_priors.get(key)
+        if face_priors is not None and index < len(face_priors):
+            return face_priors[index]
+        return None
+
+    n_faces = len(faces)
+    n_persons = len(person_boxes)
+    cost_matrix = np.full((n_faces, n_persons), 1e9, dtype=np.float32)
+
+    for f_idx, face in enumerate(faces):
+        fx1, fy1, fx2, fy2 = [float(v) for v in face.bbox]
+        fc_x = (fx1 + fx2) / 2.0
+        fc_y = (fy1 + fy2) / 2.0
+        fw = max(fx2 - fx1, 1.0)
+        fh = max(fy2 - fy1, 1.0)
+
+        for p_idx, box in enumerate(person_boxes):
+            preferred = prior_for(p_idx, person_keys[p_idx])
+            px1, py1, px2, py2 = [float(v) for v in box]
+            pw = max(px2 - px1, 1.0)
+            ph = max(py2 - py1, 1.0)
+
+            # HARD GATES:
+            # 1. Horizontal extent: face center must be within person box width + small margin
+            if not (px1 - 0.08 * pw <= fc_x <= px2 + 0.08 * pw):
+                continue
+            # 2. Vertical extent: face center must be in head/upper-torso region (-10% to +50% of height)
+            if not (py1 - 0.12 * ph <= fc_y <= py1 + 0.50 * ph):
+                continue
+            # 3. Face size sanity: face width cannot exceed person width
+            if fw > pw * 1.20:
+                continue
+
+            # Normalized geometric cost
+            dx = abs(fc_x - (px1 + px2) / 2.0) / pw
+            expected_fy = py1 + 0.16 * ph
+            dy = abs(fc_y - expected_fy) / ph
+            geom_cost = 0.55 * dx + 0.45 * dy
+
+            # Reward proximity to temporal face tracker's preferred location
+            if preferred is not None:
+                pref_iou = _bbox_iou(face.bbox, preferred)
+                if pref_iou > 0.25:
+                    geom_cost = max(0.0, geom_cost - 0.30 * pref_iou)
+
+            cost_matrix[f_idx, p_idx] = geom_cost
+
+    # A candidate is ambiguous when the same face is nearly as plausible for
+    # another eligible O. Invalid geometry remains rejected before Hungarian.
+    eligible_margins: dict[tuple[int, int], float] = {}
+    for r in range(n_faces):
+        eligible = sorted(float(x) for x in cost_matrix[r] if x < 1e9)
+        if len(eligible) > 1:
+            margin = eligible[1] - eligible[0]
+            for c in range(n_persons):
+                if cost_matrix[r, c] < 1e9:
+                    eligible_margins[(r, c)] = margin
+
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    for r, c in zip(row_ind, col_ind):
+        if cost_matrix[r, c] < 0.85:
+            key = person_keys[c]
+            margin = eligible_margins.get((r, c), None)
+            result[key] = {
+                "face": faces[r] if margin is None or margin >= 0.05 else None,
+                "face_index": int(r) if margin is None or margin >= 0.05 else None,
+                "score": float(cost_matrix[r, c]),
+                "margin": margin,
+                "status": "ASSIGNED" if margin is None or margin >= 0.05 else "AMBIGUOUS",
+            }
+
+    return result
+
+
+def assign_faces_to_persons_hungarian(
+    faces: list[FaceDetection],
+    persons: list[tuple[int, np.ndarray, np.ndarray | None]],
+    frame_shape: tuple[int, int, int],
+) -> dict[int, FaceDetection]:
+    """Compatibility view of the O-keyed assignment helper for existing tests."""
+    keys = [("default", int(inst_id)) for inst_id, _box, _preferred in persons]
+    result = assign_faces_one_to_one(
+        [box for _inst_id, box, _preferred in persons], keys, faces,
+        [preferred for _inst_id, _box, preferred in persons],
+    )
+    return {key[1]: item["face"] for key, item in result.items() if item["status"] == "ASSIGNED"}
 
 
 def torch_device(device_arg: str) -> str:
@@ -82,6 +195,36 @@ def hit_fields(hit: GalleryHit | None) -> dict:
         "threshold": hit.threshold,
         "margin_threshold": hit.margin_threshold,
     }
+
+
+def _bbox_iou(left: np.ndarray, right: np.ndarray) -> float:
+    x1 = max(float(left[0]), float(right[0]))
+    y1 = max(float(left[1]), float(right[1]))
+    x2 = min(float(left[2]), float(right[2]))
+    y2 = min(float(left[3]), float(right[3]))
+    intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    if intersection <= 0.0:
+        return 0.0
+    left_area = max(0.0, float(left[2] - left[0])) * max(0.0, float(left[3] - left[1]))
+    right_area = max(0.0, float(right[2] - right[0])) * max(0.0, float(right[3] - right[1]))
+    return intersection / max(left_area + right_area - intersection, 1e-6)
+
+
+def _deduplicate_face_candidates(
+    pending: list[tuple[int, object, np.ndarray, float, float]],
+) -> list[tuple[int, object, np.ndarray, float, float]]:
+    """Keep one person assignment when overlapping ROIs found the same face."""
+    selected: list[tuple[int, object, np.ndarray, float, float]] = []
+    ranked = sorted(
+        pending,
+        key=lambda item: (float(item[1].score) * min(float(item[3]), 100.0), float(item[1].score)),
+        reverse=True,
+    )
+    for candidate in ranked:
+        if any(_bbox_iou(candidate[1].bbox, existing[1].bbox) >= 0.50 for existing in selected):
+            continue
+        selected.append(candidate)
+    return selected
 
 
 def _balanced_face_insert(bank: list[FaceObservation], obs: FaceObservation, max_total: int) -> None:
@@ -199,105 +342,236 @@ def process_camera(
     rows: list[dict] = []
     body_bank: dict[int, list[np.ndarray]] = defaultdict(list)
     body_seen: dict[int, int] = defaultdict(int)
-    face_bank: dict[int, list[FaceObservation]] = defaultdict(list)
+    face_bank: dict[TrackKey, list[FaceObservation]] = defaultdict(list)
     first_seen: dict[int, int] = {}
     last_seen: dict[int, int] = {}
-    identity_managers: dict[int, IdentityManager] = {}
-    face_trackers: dict[int, FaceTemporalTracker] = {}
+    identity_managers: dict[TrackKey, IdentityManager] = {}
+    face_trackers: dict[TrackKey, FaceTemporalTracker] = {}
     face_debug: list[dict] = []
     temporal_debug: list[dict] = []
     db_face_candidates: dict[int, dict[int, tuple[int, float, int]]] = defaultdict(dict)
     db_face_query_debug: list[dict] = []
+    shadow_recovery = OcclusionRecoveryManager(output_dir / "live" / "occlusion_events.jsonl")
+    instance_mgr = TrackInstanceManager(max_gap=getattr(args, "track_buffer", 60))
+    last_frame_idx = -1
 
-    results = model.track(
-        source=int(source) if source.isdigit() else source,
-        stream=True,
-        persist=True,
-        tracker=str(Path(args.tracker).resolve()),
-        classes=[0],
-        conf=args.conf,
-        imgsz=args.imgsz,
-        device=args.device,
-        half=(torch_device(args.device).startswith("cuda") and not args.no_half),
-        verbose=False,
-    )
+    live_source = source.isdigit() or source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
+    live_conf = max(args.conf, 0.25) if live_source else args.conf
+    # Blurry live cameras need dense observations for temporal face evidence.
+    face_interval = max(args.face_every, 1) if live_source and args.face_every > 0 else args.face_every
+    reid_interval = max(args.reid_sample_every, 6) if live_source and args.reid_sample_every > 0 else args.reid_sample_every
+    reader: RtspLatestFrameReader | None = None
+    if live_source and source.startswith("rtsp://"):
+        reader = RtspLatestFrameReader(source)
+        reader.start()
+
+        def live_results():
+            while True:
+                captured = reader.read(timeout=5.0)
+                if captured is None:
+                    if not reader.status()["connected"] and reader.status()["consecutive_failures"] >= 12:
+                        raise RuntimeError("RTSP capture failed for 60 seconds")
+                    continue
+                tracked = model.track(
+                    source=captured.image,
+                    stream=False,
+                    persist=True,
+                    tracker=str(Path(args.tracker).resolve()),
+                    classes=[0], conf=live_conf, imgsz=448,
+                    device=args.device,
+                    half=(torch_device(args.device).startswith("cuda") and not args.no_half),
+                    verbose=False,
+                )
+                if tracked:
+                    yield tracked[0]
+
+        results = live_results()
+    else:
+        results = model.track(
+                source=int(source) if source.isdigit() else source,
+                stream=True, vid_stride=1, stream_buffer=False, persist=True,
+                tracker=str(Path(args.tracker).resolve()), classes=[0], conf=args.conf,
+                imgsz=args.imgsz, device=args.device,
+                half=(torch_device(args.device).startswith("cuda") and not args.no_half),
+                verbose=False,
+        )
 
     preview_path = output_dir / f"{cam}_local_identity.mp4"
+    preview_partial = preview_path.with_name(preview_path.stem + ".tmp.mp4")
+    live_path = output_dir / "live" / f"{cam}.jpg"
+    telemetry_path = output_dir / "live" / "telemetry.json"
+    biometric_events_path = output_dir / "live" / "biometric_events.jsonl"
+    live_path.parent.mkdir(parents=True, exist_ok=True)
+    previous_live_signatures: dict[tuple[str, int], tuple] = {}
     writer = None
     frame_idx = -1
 
+    def publish_live(frame: np.ndarray, telemetry_data: dict | None = None) -> None:
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if ok:
+            temp_path = live_path.with_name(live_path.name + ".tmp")
+            try:
+                temp_path.write_bytes(encoded.tobytes())
+                temp_path.replace(live_path)
+            except OSError:
+                temp_path.unlink(missing_ok=True)
+        if telemetry_data is not None:
+            t_temp = telemetry_path.with_name("telemetry.json.tmp")
+            try:
+                t_temp.write_text(json.dumps(telemetry_data, separators=(",", ":")), encoding="utf-8")
+                t_temp.replace(telemetry_path)
+            except OSError:
+                t_temp.unlink(missing_ok=True)
+            tracks_data = telemetry_data.get("tracks", [])
+            current_ids: set[tuple[str, int]] = set()
+            events: list[dict] = []
+            for track in tracks_data:
+                track_id = int(track.get("track_id", -1))
+                instance_id = int(track.get("instance_id", -1))
+                if track_id < 0:
+                    continue
+                if instance_id < 0:
+                    continue
+                identity_key = (str(telemetry_data.get("camera")), instance_id)
+                current_ids.add(identity_key)
+                signature = (
+                    track.get("person_id"), track.get("identity_state"),
+                    track.get("face_state"), track.get("face_decision"),
+                    bool(track.get("ambiguous")),
+                )
+                if previous_live_signatures.get(identity_key) != signature:
+                    events.append({
+                        "event_id": f"{telemetry_data.get('camera')}:O{instance_id:03d}:{telemetry_data.get('frame')}",
+                        "job_frame": int(telemetry_data.get("frame", -1)),
+                        "camera": telemetry_data.get("camera"),
+                        "track_id": track_id,
+                        "instance_id": instance_id,
+                        "object_id": f"O{instance_id:03d}",
+                        "person_id": track.get("person_id") or None,
+                        "identity_state": track.get("identity_state") or "UNIDENTIFIED",
+                        "face_state": track.get("face_state") or "ABSENT",
+                        "face_decision": track.get("face_decision") or "WAIT",
+                        "face_candidate_votes": int(track.get("face_candidate_votes", 0) or 0),
+                        "face_candidate_needed": int(track.get("face_candidate_needed", 0) or 0),
+                        "ambiguous": bool(track.get("ambiguous")),
+                        "timestamp": telemetry_data.get("timestamp"),
+                    })
+                previous_live_signatures[identity_key] = signature
+            for identity_key in set(previous_live_signatures) - current_ids:
+                ended_camera, ended_instance = identity_key
+                events.append({
+                    "event_id": f"{ended_camera}:O{ended_instance:03d}:{telemetry_data.get('frame')}:ended",
+                    "job_frame": int(telemetry_data.get("frame", -1)),
+                    "camera": ended_camera, "track_id": None,
+                    "instance_id": ended_instance, "object_id": f"O{ended_instance:03d}",
+                    "person_id": None, "identity_state": "ENDED", "face_state": "LOST",
+                    "face_decision": "TRACK_ENDED", "face_candidate_votes": 0,
+                    "face_candidate_needed": 0, "ambiguous": False,
+                    "timestamp": telemetry_data.get("timestamp"),
+                })
+                previous_live_signatures.pop(identity_key, None)
+            if events:
+                with biometric_events_path.open("a", encoding="utf-8") as event_file:
+                    for event in events:
+                        event_file.write(json.dumps(event, separators=(",", ":")) + "\n")
+
     for frame_idx, result in enumerate(results):
+        last_frame_idx = frame_idx
+        instance_mgr.expire(frame_idx, cam)
+        capture_status = reader.status() if reader is not None else None
         orig = result.orig_img
         frame = orig.copy()
         if writer is None:
             h, w = frame.shape[:2]
+            # Do not open a second RTSP session just to query FPS. Hikvision
+            # devices can stall or reject concurrent sessions under load.
             fps = 25.0
-            if not source.isdigit():
-                cap = cv2.VideoCapture(source)
-                source_fps = cap.get(cv2.CAP_PROP_FPS)
-                cap.release()
-                if source_fps and source_fps > 1:
-                    fps = source_fps
-            writer = cv2.VideoWriter(str(preview_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            writer = cv2.VideoWriter(str(preview_partial), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+            if not writer.isOpened():
+                raise RuntimeError(f"Could not open provisional video writer: {preview_partial}")
 
         boxes_obj = result.boxes
         if boxes_obj is None or boxes_obj.id is None or len(boxes_obj) == 0:
+            memory.freeze_missing_tracks(cam, frame_idx, set())
+            shadow_recovery.step(frame_idx, [])
             writer.write(frame)
+            publish_live(frame, {
+                "available": True,
+                "frame": int(frame_idx),
+                "camera": cam,
+                "timestamp": float(time.time()),
+                "tracks_count": 0,
+                "has_ambiguity": False,
+                "tracks": [], "capture": capture_status,
+            })
             continue
 
         boxes = boxes_obj.xyxy.detach().cpu().numpy()
         ids = boxes_obj.id.detach().cpu().numpy().astype(int)
         confs = boxes_obj.conf.detach().cpu().numpy()
         ambiguous = _ambiguity_flags(boxes)
+        shadow_recovery.step(
+            frame_idx,
+            [TrackObservation(int(tid), np.asarray(box, dtype=np.float32)) for box, tid in zip(boxes, ids)],
+        )
         current_rows: dict[int, dict] = {}
         box_by_tid: dict[int, np.ndarray] = {}
         ambiguity_by_tid: dict[int, bool] = {}
         conf_by_tid: dict[int, float] = {}
+        inst_map: dict[int, int] = {}
 
         for box, tid_raw, score, is_ambiguous in zip(boxes, ids, confs, ambiguous):
             tid = int(tid_raw)
-            key = (cam, tid)
-            first_seen.setdefault(tid, frame_idx)
-            last_seen[tid] = frame_idx
+            inst_id, _ = instance_mgr.get_or_create(tid, frame_idx, camera=cam)
+            inst_map[tid] = inst_id
+            key = (cam, inst_id)
+            first_seen.setdefault(inst_id, frame_idx)
+            last_seen[inst_id] = frame_idx
             box_by_tid[tid] = box
             ambiguity_by_tid[tid] = bool(is_ambiguous)
             conf_by_tid[tid] = float(score)
 
-            if tid not in identity_managers:
-                identity_managers[tid] = IdentityManager(
+            if key not in identity_managers:
+                identity_managers[key] = IdentityManager(
                     min_confirmations=args.confirm_frames,
                     min_confirmation_weight=args.confirm_weight,
                     min_support_quality=args.identity_min_quality,
                     strong_quality=args.strong_quality,
                 )
-                identity_managers[tid].ensure(tid, frame_idx)
-            if tid not in face_trackers:
-                face_trackers[tid] = FaceTemporalTracker(
+                identity_managers[key].ensure(inst_id, frame_idx)
+            if key not in face_trackers:
+                face_trackers[key] = FaceTemporalTracker(
                     min_hits=args.face_temporal_min_hits,
                     max_misses=args.face_temporal_max_misses,
                     ema_alpha=args.face_temporal_alpha,
                 )
-            face_trackers[tid].update_person(box)
+            face_trackers[key].update_person(box)
             memory.touch_track(key, frame_idx, box, ambiguous=bool(is_ambiguous))
-            db_tracklet_id = identity_db.upsert_tracklet(cam, tid, frame_idx)
+            db_tracklet_id = identity_db.upsert_tracklet(cam, inst_id, frame_idx)
             identity_db.add_detection(db_tracklet_id, frame_idx, box, float(score), bool(is_ambiguous))
 
             x1, y1, x2, y2 = [float(v) for v in box]
             row = {
                 "camera": cam, "frame": frame_idx, "track_id": tid,
+                "instance_id": inst_id, "object_id": f"O{inst_id:03d}",
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2, "conf": float(score),
                 "memory_ambiguous": bool(is_ambiguous),
             }
-            _snapshot_to_row(row, face_trackers[tid].snapshot())
+            _snapshot_to_row(row, face_trackers[key].snapshot())
             rows.append(row)
             current_rows[tid] = row
 
+        # Freeze already-bound O instances immediately when absent from this
+        # frame so a reused raw ID cannot learn a neighboring person.
+        memory.freeze_missing_tracks(cam, frame_idx, set(inst_map.values()))
+
         # ------------------------- online OSNet evidence -------------------------
-        if args.reid_sample_every > 0 and frame_idx % args.reid_sample_every == 0:
-            body_items: list[tuple[int, np.ndarray, float, bool]] = []
+        if reid_interval > 0 and frame_idx % reid_interval == 0:
+            body_items: list[tuple[int, int, np.ndarray, float, bool]] = []
             body_crops: list[np.ndarray] = []
             for box, tid_raw, score, is_ambiguous in zip(boxes, ids, confs, ambiguous):
                 tid = int(tid_raw)
+                inst_id = inst_map[tid]
                 # Skip expensive learning around crossings; this is also the
                 # period most likely to contain a tracker identity switch.
                 if is_ambiguous:
@@ -308,51 +582,70 @@ def process_camera(
                 q = _body_quality(box, orig.shape, float(score))
                 if q < args.memory_min_body_quality:
                     continue
-                body_items.append((tid, box, q, bool(is_ambiguous)))
+                body_items.append((tid, inst_id, box, q, bool(is_ambiguous)))
                 body_crops.append(crop)
             if body_crops:
                 feats = reid_embedder.encode(body_crops)
                 for item, feat, crop in zip(body_items, feats, body_crops):
-                    tid, _box, q, is_ambiguous = item
-                    body_seen[tid] += 1
-                    _reservoir_embedding(body_bank[tid], feat, body_seen[tid], args.max_reid_embeddings, tid)
+                    tid, inst_id, _box, q, is_ambiguous = item
+                    body_seen[inst_id] += 1
+                    _reservoir_embedding(body_bank[inst_id], feat, body_seen[inst_id], args.max_reid_embeddings, inst_id)
+                    shadow_recovery.add_embedding(frame_idx, tid, feat)
                     memory.observe_body(
-                        (cam, tid), frame_idx, feat, q,
+                        (cam, inst_id), frame_idx, feat, q,
                         crop=crop,
                         ambiguous=is_ambiguous,
                     )
+                    memory.promote_body_if_authorized((cam, inst_id), frame_idx, "FACE_CONFIRMED")
                     embedding_store.add(EmbeddingRecord(
-                        f"body:{cam}:{tid}:{frame_idx}", "body", cam, frame_idx, tid,
-                        feat, q, memory.state_for_track((cam, tid)).person_id,
+                        f"body:{cam}:{inst_id}:{frame_idx}", "body", cam, frame_idx, inst_id,
+                        feat, q, memory.state_for_track((cam, inst_id)).person_id,
                     ))
                     identity_db.add_observation(
-                        identity_db.upsert_tracklet(cam, tid, frame_idx), frame_idx, "body", feat, q,
+                        identity_db.upsert_tracklet(cam, inst_id, frame_idx), frame_idx, "body", feat, q,
                         pose="unknown", model_name=args.reid_name, model_version=Path(args.reid_model).name,
                         metadata={
                             "ambiguous": is_ambiguous,
                             "crop_width": int(crop.shape[1]), "crop_height": int(crop.shape[0]),
-                            "box_width": float(item[1][2] - item[1][0]),
-                            "box_height": float(item[1][3] - item[1][1]),
-                            "clipped": bool(item[1][0] <= 1 or item[1][1] <= 1),
+                            "box_width": float(item[2][2] - item[2][0]),
+                            "box_height": float(item[2][3] - item[2][1]),
+                            "clipped": bool(item[2][0] <= 1 or item[2][1] <= 1),
                             "view": "unknown",
                         },
                     )
 
         # -------------------------- SCRFD + AdaFace -----------------------------
-        detection_frame = args.face_every > 0 and frame_idx % args.face_every == 0
+        detection_frame = face_interval > 0 and frame_idx % face_interval == 0
         if detection_frame:
-            pending: list[tuple[int, object, np.ndarray, float, float]] = []
+            # Full-frame SCRFD detection executed exactly ONCE per detection frame
+            all_detected_faces = face_detector.detect(orig)
+
+            instance_keys = [(cam, inst_map[int(tid_raw)]) for tid_raw in ids if int(tid_raw) in inst_map]
+            person_boxes = [box_by_tid[int(tid_raw)] for tid_raw in ids if int(tid_raw) in inst_map]
+            face_priors = {
+                key: face_trackers[key].snapshot().bbox for key in instance_keys
+            }
+            assignments = assign_faces_one_to_one(
+                person_boxes, instance_keys, all_detected_faces, face_priors,
+            )
+
+            pending: list[tuple[int, int, object, np.ndarray, float, float, dict]] = []
             for box, tid_raw in zip(boxes, ids):
                 tid = int(tid_raw)
-                tracker = face_trackers[tid]
-                preferred = tracker.snapshot().bbox
-                face = detect_best_face_in_person(orig, box, face_detector, preferred_bbox=preferred)
+                inst_id = inst_map[tid]
+                o_key = (cam, inst_id)
+                tracker = face_trackers[o_key]
+                assignment = assignments[o_key]
+                face = assignment["face"]
+
                 if face is None:
                     snap = tracker.miss()
                     temporal_debug.append({
-                        "camera": cam, "frame": frame_idx, "track_id": tid, "detected": False,
+                        "camera": cam, "frame": frame_idx, "track_id": tid, "instance_id": inst_id, "detected": False,
                         "state": snap.state, "hits": snap.hits, "misses": snap.misses,
                         "detector_score": "", "face_size": "",
+                        "face_owner_status": assignment["status"], "face_index": assignment["face_index"],
+                        "face_assignment_score": assignment["score"], "face_assignment_margin": assignment["margin"],
                     })
                     continue
 
@@ -361,24 +654,30 @@ def process_camera(
                 fsize = min(fw, fh)
                 snap = tracker.observe(face.bbox, face.kps, face.score, frame_idx)
                 temporal_debug.append({
-                    "camera": cam, "frame": frame_idx, "track_id": tid, "detected": True,
+                    "camera": cam, "frame": frame_idx, "track_id": tid, "instance_id": inst_id, "detected": True,
                     "state": snap.state, "hits": snap.hits, "misses": snap.misses,
                     "detector_score": float(face.score), "face_size": float(fsize),
+                    "face_owner_status": assignment["status"], "face_index": assignment["face_index"],
+                    "face_assignment_score": assignment["score"], "face_assignment_margin": assignment["margin"],
                 })
 
                 # Detection continuity and recognition evidence are separate.
+                # During a crossing, person-to-face association is ambiguous;
+                # do not let one face train or relabel multiple tracks.
+                if ambiguity_by_tid.get(tid, False):
+                    continue
                 if fsize < args.min_face_detect_size:
                     continue
                 aligned = align_face_bgr(orig, face.kps)
                 if aligned is None:
                     continue
                 blur = laplacian_blur_score(aligned)
-                pending.append((tid, face, aligned, fsize, blur))
+                pending.append((tid, inst_id, face, aligned, fsize, blur, assignment))
 
             if pending:
-                feats, norms = face_embedder.encode([x[2] for x in pending])
+                feats, norms = face_embedder.encode([x[3] for x in pending])
                 for item, feat, norm in zip(pending, feats, norms):
-                    tid, face, _aligned, fsize, blur = item
+                    tid, inst_id, face, _aligned, fsize, blur, _assignment = item
                     q = compute_quality(face.score, fsize, blur, float(norm), face.kps, norm_ref=args.adaface_norm_ref)
                     hit = None
                     if q.tier != "reject":
@@ -386,29 +685,35 @@ def process_camera(
                             frame_idx, feat, q.score, q.tier, q.detector_score, q.face_size, q.blur, q.feature_norm,
                             q.pose.label, q.pose.yaw_proxy, q.pose.pitch_proxy, q.pose.roll_deg,
                         )
-                        _balanced_face_insert(face_bank[tid], obs, args.max_face_samples)
+                        _balanced_face_insert(face_bank[(cam, inst_id)], obs, args.max_face_samples)
                         if gallery:
                             hit = match_gallery(
                                 feat, gallery, q.score,
                                 base_threshold=args.identity_threshold,
                                 base_margin=args.identity_margin,
                             )
-                            identity_managers[tid].update(tid, frame_idx, hit, q.score, q.tier)
+                            identity_managers[(cam, inst_id)].update(inst_id, frame_idx, hit, q.score, q.tier)
 
-                        id_state_now = identity_managers[tid].final(tid)
+                        id_state_now = identity_managers[(cam, inst_id)].final(inst_id)
+                        # Weak-but-usable CCTV faces may contribute to identity
+                        # evidence after repeated observations; one frame still
+                        # cannot establish authority.
+                        authority_tier = (
+                            "support" if q.tier == "weak" and q.score >= args.person_face_learn_quality else q.tier
+                        )
                         face_auth = memory.observe_face(
-                            (cam, tid), frame_idx, feat, q.score, q.pose.label, q.tier,
+                            (cam, inst_id), frame_idx, feat, q.score, q.pose.label, authority_tier,
                             aligned_crop=_aligned,
                             gallery_employee=id_state_now.employee_id,
                             gallery_accepted=(id_state_now.state == "CONFIRMED" and bool(id_state_now.employee_id)),
                         )
                         embedding_store.add(EmbeddingRecord(
-                            f"face:{cam}:{tid}:{frame_idx}", "face", cam, frame_idx, tid,
-                            feat, q.score, memory.state_for_track((cam, tid)).person_id,
+                            f"face:{cam}:{inst_id}:{frame_idx}", "face", cam, frame_idx, inst_id,
+                            feat, q.score, memory.state_for_track((cam, inst_id)).person_id,
                             q.pose.label,
                         ))
                         identity_db.add_observation(
-                            identity_db.upsert_tracklet(cam, tid, frame_idx), frame_idx, "face", feat, q.score,
+                            identity_db.upsert_tracklet(cam, inst_id, frame_idx), frame_idx, "face", feat, q.score,
                             pose=q.pose.label, feature_norm=float(norm), model_name="adaface_ir50",
                             model_version=Path(args.adaface_checkpoint).name,
                             metadata={
@@ -422,7 +727,7 @@ def process_camera(
                         # the synchronized body view at the same frame so body
                         # learning is tied to the face-confirmed person rather
                         # than to clothing-only frames sampled independently.
-                        if q.tier in {"support", "strong"} and frame_idx % args.reid_sample_every != 0:
+                        if q.tier in {"support", "strong"} and reid_interval > 0 and frame_idx % reid_interval != 0:
                             body_crop = safe_crop(orig, box_by_tid[tid])
                             if body_crop is not None:
                                 body_quality = _body_quality(box_by_tid[tid], orig.shape, conf_by_tid[tid])
@@ -430,11 +735,12 @@ def process_camera(
                                 if len(body_features):
                                     body_feature = body_features[0]
                                     memory.observe_body(
-                                        (cam, tid), frame_idx, body_feature, body_quality,
+                                        (cam, inst_id), frame_idx, body_feature, body_quality,
                                         crop=body_crop, ambiguous=ambiguity_by_tid.get(tid, False),
                                     )
+                                    memory.promote_body_if_authorized((cam, inst_id), frame_idx, "FACE_CONFIRMED")
                                     identity_db.add_observation(
-                                        identity_db.upsert_tracklet(cam, tid, frame_idx), frame_idx,
+                                        identity_db.upsert_tracklet(cam, inst_id, frame_idx), frame_idx,
                                         "body", body_feature, body_quality, pose="unknown",
                                         model_name=args.reid_name, model_version=Path(args.reid_model).name,
                                         metadata={
@@ -453,12 +759,12 @@ def process_camera(
                             if db_hits:
                                 best = db_hits[0]
                                 second_score = db_hits[1].score if len(db_hits) > 1 else -1.0
-                                current = memory.state_for_track((cam, tid))
+                                current = memory.state_for_track((cam, inst_id))
                                 weak_face = q.tier == "weak"
                                 match_threshold = args.person_face_weak_threshold if weak_face else args.person_face_threshold
                                 needed_votes = args.person_face_weak_confirmations if weak_face else args.person_face_confirmations
                                 db_face_query_debug.append({
-                                    "camera": cam, "frame": frame_idx, "track_id": tid,
+                                    "camera": cam, "frame": frame_idx, "track_id": tid, "instance_id": inst_id,
                                     "tier": q.tier, "top1": best.identity_id,
                                     "score": best.score, "margin": best.score - second_score,
                                     "support": best.support, "threshold": match_threshold,
@@ -471,7 +777,7 @@ def process_camera(
                                     and (current is None or best.identity_id != current.person_id)
                                     and best.score >= match_threshold
                                 ):
-                                    candidates = db_face_candidates[tid]
+                                    candidates = db_face_candidates[inst_id]
                                     previous = candidates.get(best.identity_id)
                                     if previous and frame_idx - previous[2] <= args.person_face_candidate_gap:
                                         votes = previous[0] + 1
@@ -495,17 +801,22 @@ def process_camera(
                                         )
                                         identity_db.ensure_identity(best.identity_id, state="VERIFIED")
                                         identity_db.assign(
-                                            identity_db.upsert_tracklet(cam, tid, frame_idx), best.identity_id,
+                                            identity_db.upsert_tracklet(cam, inst_id, frame_idx), best.identity_id,
                                             frame_idx, "CONFIRMED", "online_db_face_reconciliation",
                                             score_sum / votes, vote_margin,
                                         )
-                                        db_face_candidates.pop(tid, None)
+                                        db_face_candidates.pop(inst_id, None)
                     else:
                         face_auth = None
 
                     anon_fields = face_auth.row_fields() if face_auth is not None else {}
                     face_debug.append({
-                        "camera": cam, "frame": frame_idx, "track_id": tid,
+                        "camera": cam, "frame": frame_idx, "track_id": tid, "raw_track_id": tid,
+                        "instance_id": inst_id, "object_id": f"O{inst_id:03d}",
+                        "face_owner_status": _assignment["status"],
+                        "face_index": _assignment["face_index"],
+                        "face_assignment_score": _assignment["score"],
+                        "face_assignment_margin": _assignment["margin"],
                         "detector_score": q.detector_score, "face_size": q.face_size, "blur": q.blur,
                         "feature_norm": q.feature_norm, "quality": q.score, "tier": q.tier,
                         "pose": q.pose.label, "yaw_proxy": q.pose.yaw_proxy, "pitch_proxy": q.pose.pitch_proxy,
@@ -515,13 +826,14 @@ def process_camera(
         # ------------------------- resolve + render online -----------------------
         for box, tid_raw in zip(boxes, ids):
             tid = int(tid_raw)
-            key = (cam, tid)
-            id_state = identity_managers[tid].final(tid)
+            inst_id = inst_map[tid]
+            key = (cam, inst_id)
+            id_state = identity_managers[(cam, inst_id)].final(inst_id)
             if id_state.state == "CONFIRMED" and id_state.employee_id:
                 memory.confirm_employee(key, frame_idx, id_state.employee_id, source="gallery_multi_frame")
             memory.maybe_seed_person(key, frame_idx)
             online_state = memory.state_for_track(key)
-            db_tracklet_id = identity_db.upsert_tracklet(cam, tid, frame_idx)
+            db_tracklet_id = identity_db.upsert_tracklet(cam, inst_id, frame_idx)
             online_pid = online_state.person_id if online_state is not None else None
             if online_pid is not None:
                 identity_db.ensure_identity(online_pid)
@@ -530,7 +842,7 @@ def process_camera(
                 online_state.bind_reason if online_state and online_state.bind_reason else "unbound",
             )
 
-            snap = face_trackers[tid].snapshot()
+            snap = face_trackers[(cam, inst_id)].snapshot()
             row = current_rows[tid]
             _snapshot_to_row(row, snap)
             mem_label, mem_sub = _memory_overlay(memory, key)
@@ -542,6 +854,7 @@ def process_camera(
             row["person_bind_reason"] = mem_state.bind_reason if mem_state else ""
             row["memory_maturity"] = profile.maturity() if profile is not None else "UNBOUND"
             row["memory_confidence"] = round(profile.confidence(), 6) if profile is not None else 0.0
+            row["identity_state"] = id_state.state if id_state.employee_id else row["memory_maturity"]
             diag = memory.face_diagnostic(key)
             if diag is not None:
                 row.update(diag.row_fields())
@@ -580,11 +893,39 @@ def process_camera(
             cv2.putText(frame, face_id_line, (x1, max(20, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX,
                         0.36, (255, 255, 255), 1, cv2.LINE_AA)
 
+        active_tracks_telemetry = []
+        for tid in ids:
+            r = current_rows.get(tid)
+            if r:
+                active_tracks_telemetry.append({
+                    "track_id": int(tid),
+                    "instance_id": int(r["instance_id"]),
+                    "object_id": r.get("object_id", f"O{int(r['instance_id']):03d}"),
+                    "person_id": r.get("person_id"),
+                    "identity_state": r.get("identity_state"),
+                    "face_state": r.get("face_state", "ABSENT"),
+                    "face_decision": r.get("face_id_decision", "WAIT"),
+                    "face_candidate_votes": int(r.get("face_id_candidate_votes", 0) or 0),
+                    "face_candidate_needed": int(r.get("face_id_candidate_needed", 0) or 0),
+                    "ambiguous": bool(ambiguity_by_tid.get(tid, False)),
+                })
         writer.write(frame)
-
+        publish_live(frame, {
+            "available": True,
+            "frame": int(frame_idx),
+            "camera": cam,
+            "timestamp": float(time.time()),
+            "tracks_count": len(boxes),
+            "has_ambiguity": any(ambiguous),
+            "tracks": active_tracks_telemetry, "capture": capture_status,
+        })
+    shadow_recovery.close(last_frame_idx)
+    if reader is not None:
+        reader.close()
     if writer is not None:
         writer.release()
-    spans = {tid: TrackSpan(first_seen[tid], last_seen[tid]) for tid in first_seen}
+        preview_partial.replace(preview_path)
+    spans = {inst_id: TrackSpan(first_seen[inst_id], last_seen[inst_id]) for inst_id in first_seen}
     print(
         f"[track] {cam}: frames={frame_idx + 1}, tracks={len(first_seen)}, face_tracks={len(face_bank)}, "
         f"person_ids={len(memory.profiles)}"
@@ -654,7 +995,7 @@ def render_identity(
     memory: PersonMemory,
     output: Path,
 ) -> None:
-    if source.isdigit():
+    if source.isdigit() or source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://")):
         return
     by_frame: dict[int, list[dict]] = defaultdict(list)
     for row in rows:
@@ -666,26 +1007,39 @@ def render_identity(
         render_events[key] = merge_render_events(track, getattr(ident, "employee_id", None))
 
     cap = cv2.VideoCapture(source)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not reopen seekable source for final render: {source}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not np.isfinite(fps) or fps <= 0 or fps > 240:
+        fps = 25.0
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    writer = cv2.VideoWriter(str(output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if w <= 0 or h <= 0:
+        cap.release()
+        raise RuntimeError(f"Invalid source dimensions for final render: {source}")
+    partial_output = output.with_name(output.stem + ".tmp.mp4")
+    writer = cv2.VideoWriter(str(partial_output), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open final video writer: {partial_output}")
     idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         for row in by_frame.get(idx, []):
+            if "instance_id" not in row:
+                raise RuntimeError(f"Missing instance_id at camera={row.get('camera')} frame={row.get('frame')}")
             tid = int(row["track_id"])
-            key = (cam, tid)
-            pid_text = str(row.get("person_id", "") or "")
-            if pid_text.startswith("P") and pid_text[1:].isdigit():
-                pid = int(pid_text[1:])
-            else:
-                pid = memory.person_id_at(key, idx)
+            inst_id = int(row["instance_id"])
+            key = (cam, inst_id)
+            # Render from finalized segment history, not stale online rows.
+            pid = memory.person_id_at(key, idx)
             mem_state = memory.state_for_track(key)
             ident = profiles.get(pid) if pid is not None else None
             event = state_at(render_events.get(key, []), idx)
-            if event and event.employee_id:
+            if getattr(ident, "employee_id", None):
+                identity_text = ident.employee_id
+            elif event and event.employee_id:
                 if event.state == "CONFIRMED":
                     identity_text = event.employee_id
                 elif event.state == "REACQUIRED":
@@ -698,8 +1052,8 @@ def render_identity(
             x1, y1, x2, y2 = [int(float(row[k])) for k in ("x1", "y1", "x2", "y2")]
             maturity = getattr(ident, "maturity", lambda: "PENDING")()
             confidence = getattr(ident, "confidence", lambda: 0.0)()
-            public_id = f"P:{pid:03d}" if pid is not None else "P:---"
-            label = f"{public_id} L:{tid} {identity_text}"
+            g_label = f"G{pid:03d}" if pid is not None else "G:---"
+            label = f"L{tid:03d} | O{inst_id:03d} | {g_label} | {identity_text}"
             status = "BOUND" if mem_state is not None and mem_state.person_id is not None else "UNBOUND"
             sub = f"MEM:{maturity} {confidence:.2f} {status} FACE:{row.get('face_state', 'ABSENT')}"
             top1 = str(row.get("face_id_top1", "") or "")
@@ -734,6 +1088,7 @@ def render_identity(
         idx += 1
     cap.release()
     writer.release()
+    partial_output.replace(output)
 
 
 def save_csv(path: Path, rows: list[dict]) -> None:
@@ -760,6 +1115,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--identity-store", default=None, help="Previous run embedding_store directory to restore P profiles")
     p.add_argument("--identity-db", default=None, help="SQLite identity database path; defaults to <output>/identity.sqlite")
     p.add_argument("--canonical-db", default=None, help="Read-only canonical reference DB")
+    p.add_argument("--canonical-output", default=None, help="Explicit destination for canonical export")
     p.add_argument("--device", default="0")
     legacy_model = ASSETS_ROOT / "models" / "yolo" / "yolo11s.pt"
     p.add_argument("--yolo", default=str(legacy_model if legacy_model.is_file() else "yolo11s.pt"))
@@ -779,9 +1135,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--scrfd-model", default=None)
     p.add_argument("--face-roi-input", type=int, default=0, help="0=auto: 640 for SCRFD 10G, 320 for 2.5G")
-    p.add_argument("--face-det-threshold", type=float, default=0.20)
-    p.add_argument("--face-every", type=int, default=2)
-    p.add_argument("--min-face-detect-size", type=float, default=16.0)
+    p.add_argument("--face-det-threshold", type=float, default=0.15)
+    p.add_argument("--face-every", type=int, default=1)
+    p.add_argument("--min-face-detect-size", type=float, default=14.0)
     p.add_argument("--max-face-samples", type=int, default=80)
     p.add_argument("--face-prototypes-per-pose", type=int, default=12)
     p.add_argument("--face-temporal-min-hits", type=int, default=2)
@@ -798,7 +1154,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gallery-min-quality", type=float, default=0.42)
     p.add_argument("--identity-threshold", type=float, default=0.55)
     p.add_argument("--identity-margin", type=float, default=0.07)
-    p.add_argument("--identity-min-quality", type=float, default=0.32)
+    p.add_argument("--identity-min-quality", type=float, default=0.45)
     p.add_argument("--strong-quality", type=float, default=0.68)
     p.add_argument("--confirm-frames", type=int, default=3)
     p.add_argument("--confirm-weight", type=float, default=1.45)
@@ -810,21 +1166,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--person-motion-only-gap", type=int, default=6)
     p.add_argument("--person-new-after", type=int, default=12)
     p.add_argument("--person-ambiguity-grace", type=int, default=8)
-    p.add_argument("--person-face-threshold", type=float, default=0.56)
-    p.add_argument("--person-face-margin", type=float, default=0.04)
-    p.add_argument("--person-face-learn-quality", type=float, default=0.32)
-    p.add_argument("--person-face-confirmations", type=int, default=2)
+    p.add_argument("--person-face-threshold", type=float, default=0.64)
+    p.add_argument("--person-face-margin", type=float, default=0.06)
+    p.add_argument("--person-face-view-threshold", type=float, default=0.58)
+    p.add_argument("--person-face-learn-quality", type=float, default=0.30)
+    p.add_argument("--person-face-confirmations", type=int, default=3)
     p.add_argument("--person-face-weak-threshold", type=float, default=0.45)
     p.add_argument("--person-face-weak-confirmations", type=int, default=3)
-    p.add_argument("--person-new-face-confirmations", type=int, default=2)
+    p.add_argument("--person-new-face-confirmations", type=int, default=3)
     p.add_argument("--person-face-candidate-gap", type=int, default=16)
     p.add_argument("--person-recent-face-frames", type=int, default=300)
     p.add_argument("--person-body-near", type=float, default=0.76)
-    p.add_argument("--person-body-far", type=float, default=0.84)
-    p.add_argument("--person-body-margin", type=float, default=0.05)
+    p.add_argument("--person-body-far", type=float, default=0.82)
+    p.add_argument("--person-body-margin", type=float, default=0.06)
     p.add_argument("--person-body-novelty", type=float, default=0.91)
     p.add_argument("--person-body-jump", type=float, default=0.48)
-    p.add_argument("--person-max-face-per-pose", type=int, default=8)
+    p.add_argument("--person-max-face-per-pose", type=int, default=12)
     p.add_argument("--person-max-body-views", type=int, default=24)
     p.add_argument("--require-face-before-person", action=argparse.BooleanOptionalAction, default=True)
     return p.parse_args()
@@ -841,6 +1198,14 @@ def main() -> None:
     t0 = time.perf_counter()
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
+    for source in args.sources:
+        if source.isdigit():
+            capture = cv2.VideoCapture(int(source))
+            try:
+                if not capture.isOpened():
+                    raise RuntimeError(f"Could not open camera source {source}. Check that the camera is connected and available.")
+            finally:
+                capture.release()
     device = torch_device(args.device)
     if device.startswith("cuda"):
         if not torch.cuda.is_available():
@@ -889,6 +1254,7 @@ def main() -> None:
         ambiguity_grace_frames=args.person_ambiguity_grace,
         face_match_threshold=args.person_face_threshold,
         face_match_margin=args.person_face_margin,
+        face_view_update_threshold=args.person_face_view_threshold,
         face_learn_quality=args.person_face_learn_quality,
         face_match_confirmations=args.person_face_confirmations,
         face_new_confirmations=args.person_new_face_confirmations,
@@ -909,7 +1275,14 @@ def main() -> None:
     if args.canonical_db and Path(args.canonical_db).resolve() == identity_db_path:
         raise SystemExit("--canonical-db and --identity-db must be different files")
     identity_db = IdentityDatabase(identity_db_path)
-    canonical_db = IdentityDatabase(args.canonical_db, readonly=True) if args.canonical_db else identity_db
+    if args.canonical_db:
+        canonical_path = Path(args.canonical_db).resolve()
+        if not canonical_path.exists():
+            with IdentityDatabase(canonical_path, session_id="canonical-bootstrap"):
+                pass
+        canonical_db = IdentityDatabase(canonical_path, readonly=True)
+    else:
+        canonical_db = identity_db
     evidence_fusion = TrackletEvidenceFusion(
         face_threshold=args.person_face_threshold,
         weak_face_threshold=args.person_face_weak_threshold,
@@ -929,6 +1302,7 @@ def main() -> None:
     rows_by_cam: dict[str, list[dict]] = {}
     sources_by_cam: dict[str, str] = {}
     tracks: dict[TrackKey, TrackSummary] = {}
+    body_banks_by_key: dict[TrackKey, list[np.ndarray]] = {}
     face_debug_all: list[dict] = []
     temporal_debug_all: list[dict] = []
     db_face_query_all: list[dict] = []
@@ -945,19 +1319,20 @@ def main() -> None:
         temporal_debug_all.extend(temporal_debug)
         db_face_query_all.extend(db_face_query)
 
-        for tid, span in spans.items():
-            body_feats = body_bank.get(tid, [])
+        for inst_id, span in spans.items():
+            body_feats = body_bank.get(inst_id, [])
             body_protos = select_body_prototypes(
                 np.stack(body_feats).astype(np.float32) if body_feats else np.empty((0, 512), dtype=np.float32),
                 max_prototypes=args.body_prototypes,
             )
             face_protos = aggregate_face_observations(
-                face_bank.get(tid, []),
+                face_bank.get((cam, inst_id), []),
                 top_k_per_pose=args.face_prototypes_per_pose,
                 min_quality=0.20,
             )
-            st = managers[tid].final(tid)
-            key = (cam, tid)
+            st = managers[(cam, inst_id)].final(inst_id)
+            key = (cam, inst_id)
+            body_banks_by_key[key] = list(body_bank.get(inst_id, []))
             tracks[key] = TrackSummary(
                 key=key,
                 span=span,
@@ -982,6 +1357,13 @@ def main() -> None:
     for key in sorted(memory.tracks):
         track_observations = [x for x in embedding_store.records if x.camera == key[0] and x.track_id == key[1]]
         memory.reconcile_track_faces(key, track_observations)
+        # Online binding already consumes trusted face/body evidence. Do not
+        # replay the complete store and duplicate anchors without tier context.
+        track = tracks.get(key)
+        if track is not None:
+            profile = memory.profile_for_track(key)
+            track.confirmed_employee = getattr(profile, "employee_id", None)
+            track.final_state = "CONFIRMED" if track.confirmed_employee else "PROVISIONAL"
 
     # Database-backed face/body fusion also covers long gaps where face-only
     # reconciliation has insufficient evidence.
@@ -989,7 +1371,9 @@ def main() -> None:
     for key, st in sorted(memory.tracks.items()):
         db_tracklet_id = identity_db.upsert_tracklet(key[0], key[1], st.last_frame)
         observations = [x for x in embedding_store.records if x.camera == key[0] and x.track_id == key[1]]
-        face_vectors = [x.embedding for x in observations if x.kind == "face" and x.quality >= 0.20]
+        # Only trusted current-track face samples may drive a DB rebind. The
+        # reference DB support count is not evidence from this track.
+        face_vectors = [x.embedding for x in observations if x.kind == "face" and x.quality >= 0.45]
         body_vectors = [x.embedding for x in observations if x.kind == "body" and x.quality >= args.memory_min_body_quality]
         face_hits = canonical_db.search_identities(
             face_vectors, "face", "adaface_ir50", Path(args.adaface_checkpoint).name,
@@ -1012,7 +1396,14 @@ def main() -> None:
         target_pid = decision.identity_id
         reason = f"db_{decision.reason.lower()}" if decision.identity_id is not None else ""
         score = decision.fusion_score
-        if target_pid is not None and target_pid != st.person_id and target_pid in memory.profiles:
+        face_confirmed = (
+            decision.state == "CONFIRMED"
+            and decision.reason in {"FACE_ONLY", "FACE_BODY"}
+            and decision.face_score is not None
+            and decision.face_score >= args.person_face_threshold
+            and len(face_vectors) >= args.person_face_confirmations
+        )
+        if face_confirmed and target_pid is not None and target_pid != st.person_id and target_pid in memory.profiles:
             overlapping = any(
                 other.key[0] == key[0] and other.key != key and other.person_id == target_pid
                 and other.first_frame <= st.last_frame and st.first_frame <= other.last_frame
@@ -1036,11 +1427,42 @@ def main() -> None:
                 "CONFIRMED" if segment.authority == "face" else "PROVISIONAL",
                 segment.reason,
             )
-        if st.person_id is not None and memory.profiles[st.person_id].face_core():
-            identity_db.promote_tracklet_references(db_tracklet_id, st.person_id)
+        for segment in sorted(st.segments, key=lambda item: item.start_frame):
+            if segment.person_id is None:
+                continue
+            profile = memory.profiles.get(segment.person_id)
+            if profile is None or not profile.face_core():
+                continue
+            identity_db.promote_tracklet_references(
+                db_tracklet_id,
+                segment.person_id,
+                start_frame=segment.start_frame,
+                end_frame=segment.end_frame if segment.end_frame is not None else st.last_frame,
+                # A body-only continuity lease may keep P stable, but it must
+                # not seed canonical identity evidence without face authority.
+                include_body=segment.authority == "face",
+                include_face=True,
+            )
     memory.save_metadata_all()
     embedding_store.save()
+    body_events_path = out_dir / "body_reacquisition_events.jsonl"
+    with body_events_path.open("w", encoding="utf-8") as handle:
+        for event in memory.body_decision_events:
+            enriched = dict(event)
+            matching_rows = [
+                row for row in all_rows
+                if row.get("camera") == event.get("camera")
+                and int(row.get("instance_id", -1)) == int(str(event["object_id"])[1:])
+                and int(row.get("frame", -1)) == int(event["frame"])
+            ]
+            enriched["raw_track_id"] = matching_rows[0].get("track_id") if matching_rows else None
+            if enriched.get("runner_up_person_id") is not None:
+                enriched["runner_up_global_id"] = f"G{int(enriched['runner_up_person_id']):03d}"
+            handle.write(json.dumps(enriched, separators=(",", ":")) + "\n")
     print(f"[identity-db] integrity={identity_db.integrity_check()} path={identity_db.path}")
+    if args.canonical_output and identity_db.canonical_stats()["observations"] > 0:
+        identity_db.export_canonical(args.canonical_output)
+        print(f"[identity-db] canonical export={args.canonical_output}")
     identity_db.close()
     if canonical_db is not identity_db:
         canonical_db.close()
@@ -1053,11 +1475,17 @@ def main() -> None:
         render_event_cache[key] = merge_render_events(track, getattr(profile, "employee_id", None))
 
     for row in all_rows:
-        key = (row["camera"], int(row["track_id"]))
+        if "instance_id" not in row:
+            raise RuntimeError(
+                f"Missing instance_id at camera={row.get('camera')} "
+                f"frame={row.get('frame')} track_id={row.get('track_id')}"
+            )
+        key = (row["camera"], int(row["instance_id"]))
         frame = int(row["frame"])
         resolved_pid = memory.person_id_at(key, frame)
         fusion_state = getattr(fusion_debug_by_key.get(key), "state", "")
-        if fusion_state in {"CONFLICT", "UNKNOWN"}:
+        # No canonical hit is not a negative identity decision.
+        if fusion_state == "CONFLICT":
             resolved_pid = None
         pid = resolved_pid if resolved_pid is not None else None
         pid_text = f"P{pid:03d}" if pid is not None else ""
@@ -1068,7 +1496,8 @@ def main() -> None:
         export_rows.append({
             **row,
             "person_id": pid_text,
-            "identity": employee or (event.employee_id if event and event.employee_id else "UNKNOWN"),
+            "global_id": f"G{pid:03d}" if pid is not None else "",
+            "identity": employee or "UNKNOWN",
             "identity_state": "CONFIRMED" if employee else (event.state if event else "UNIDENTIFIED"),
             "fusion_identity": getattr(fusion_debug_by_key.get(key), "identity_id", None),
             "fusion_state": getattr(fusion_debug_by_key.get(key), "state", ""),

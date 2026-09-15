@@ -113,3 +113,31 @@ gallery\
 - `setup.ps1` tự loại các `.pth` cũ chứa `deep-person-reid` trong venv rồi đăng ký đúng source của project này.
 - Không cài lại Torch.
 - Threshold hiện là baseline benchmark; production cần calibration trên camera thật.
+
+## Web Console
+
+Project now includes a React + FastAPI console under `frontend/` and `backend/`.
+The web worker keeps the existing `infer.py` CLI as the execution authority and
+runs every job in an isolated directory under `.appdata/jobs/<job-id>/`.
+
+Install the API dependencies and start both services:
+
+```powershell
+pip install -r requirements.txt
+.\start_console.ps1
+```
+
+Or start them separately:
+
+```powershell
+python -m uvicorn backend.app:app --reload --port 8000
+cd frontend
+npm.cmd install
+npm.cmd run dev
+```
+
+Open `http://127.0.0.1:5173`. The console supports video upload, server-side
+webcam index `0`, RTSP/HTTP source registration, isolated infer jobs, output
+artifact downloads, job logs, and fusion-state review. Browser webcam preview is
+available for permission/testing; actual inference uses the selected server-side
+device or stream URL.
